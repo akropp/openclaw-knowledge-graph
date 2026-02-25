@@ -262,8 +262,15 @@ export function isGarbageEntityName(s: string): boolean {
   if (s.startsWith("**") || s.startsWith("- ") || s.startsWith("* ")) return true;
   // Code / special chars
   if (s.includes("`") || s.includes("→") || s.includes("\n")) return true;
-  // Em-dash separators and comma lists (addresses, enumerations)
-  if (s.includes(" — ") || s.includes(", ")) return true;
+  // Em-dash separators
+  if (s.includes(" — ")) return true;
+  // Comma lists — but allow "city, state" patterns like "tarrytown, new york"
+  // Reject if: multiple commas, contains digits after comma, or too long for place name
+  if (s.includes(", ")) {
+    const commaCount = (s.match(/,/g) || []).length;
+    const afterComma = s.slice(s.indexOf(", ") + 2);
+    if (commaCount > 1 || /\d/.test(afterComma) || s.length > 40) return true;
+  }
   // Concatenated items
   if (s.includes(" + ")) return true;
   // Sentence break: ". Capital"
