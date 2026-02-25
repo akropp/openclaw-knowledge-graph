@@ -11,6 +11,7 @@ export interface KGConfig {
     baseUrl?: string;
     model?: string;
     apiKey?: string;
+    chunkSize?: number;
   };
 }
 

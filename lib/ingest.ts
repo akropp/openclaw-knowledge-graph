@@ -25,6 +25,7 @@ export interface IngestOptions {
   ollamaUrl?: string;
   model?: string;
   apiKey?: string;
+  chunkSize?: number;
   fresh?: boolean;
 }
 
@@ -363,7 +364,7 @@ async function processSessionFileWithLLM(
   }
 
   // Chunk messages for LLM processing
-  const chunks = chunkMessages(messages, 2000);
+  const chunks = chunkMessages(messages, opts.chunkSize);
 
   if (opts.verbose) {
     console.log(`    Processing ${messages.length} messages in ${chunks.length} chunks with LLM...`);

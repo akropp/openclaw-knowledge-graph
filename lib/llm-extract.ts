@@ -175,7 +175,7 @@ export async function extractTriplesWithLLM(
  */
 export function chunkMessages(
   messages: Array<{ role: string; text: string }>,
-  maxChars: number = 2000
+  maxChars: number = 16000
 ): string[] {
   const chunks: string[] = [];
   let currentChunk: string[] = [];

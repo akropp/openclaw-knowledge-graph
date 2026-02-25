@@ -476,7 +476,7 @@ program
       console.log(`Messages: ${messages.length}`);
 
       // Chunk and process
-      const chunks = chunkMessages(messages, 2000);
+      const chunks = chunkMessages(messages, config.llm?.chunkSize);
       console.log(`Chunks: ${chunks.length}\n`);
 
       const allTriples = [];
