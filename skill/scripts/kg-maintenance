@@ -6,6 +6,7 @@ import { homedir } from "node:os";
 import { program } from "commander";
 import { GraphDB } from "../../dist/lib/graph-db.js";
 import { loadConfig } from "../../dist/lib/config.js";
+import { isGarbageEntityName } from "../../dist/lib/entity-extract.js";
 
 function getDbPath(opts) {
   if (opts?.db) return resolve(opts.db);
@@ -649,30 +650,12 @@ program
       // ── Phase 1: Auto-cleanup ────────────────────────────────────────────
       console.log("=== Phase 1: Auto-cleanup ===\n");
 
-      // Reject garbage entities FIRST (before clustering or triple review)
-      const isSentenceLikeEntity = (s) => {
-        if (!s) return false;
-        // Phone numbers are valid: +19147721291, 914-555-1234
-        if (/^\+?[\d\s\-().]{7,20}$/.test(s)) return false;
-        return (
-          s.startsWith("**") || s.startsWith("- ") || s.startsWith("* ") ||
-          s.includes("`") || s.includes("→") || s.includes("\n") ||
-          s.includes(" — ") ||                              // em-dash separators
-          s.includes(", ") ||                               // comma-separated lists
-          s.includes(" + ") ||                              // concatenated items
-          /\([^)]*\s+[^)]+\)/.test(s) ||                   // parenthetical with multiple words (description, not nickname)
-          (s.includes(":") && !s.match(/^\+?[\d\s\-().]+$/)) || // colon (not in phone)
-          /\. [A-Z]/.test(s) ||                             // sentence break
-          (/[0-9]{5,}/.test(s) && !/^\+?[\d\s\-().]+$/.test(s)) || // long digits (not phone)
-          s.split(/\s+/).length > 5 ||
-          s.length > 50
-        );
-      };
+      // isGarbageEntityName imported from entity-extract.js — NLP-based detection
 
       const allEntities = db.exportAll().entities.filter(e => !e.rejected);
       let autoRejectedEntityCount = 0;
       for (const entity of allEntities) {
-        if (isSentenceLikeEntity(entity.name)) {
+        if (isGarbageEntityName(entity.name)) {
           if (opts.verbose) {
             console.log(`  [GARBAGE-ENTITY] "${entity.name.substring(0, 80)}"`);
           }
@@ -726,7 +709,7 @@ program
           continue;
         }
 
-        if (isSentenceLikeEntity(triple.subject) || isSentenceLikeEntity(triple.object)) {
+        if (isGarbageEntityName(triple.subject) || isGarbageEntityName(triple.object)) {
           if (opts.verbose) {
             console.log(`  [SENTENCE]    #${triple.id}: ${triple.subject.substring(0, 60)} -[${triple.predicate}]-> ${triple.object.substring(0, 60)}`);
           }

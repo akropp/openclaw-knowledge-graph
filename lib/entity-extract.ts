@@ -244,6 +244,53 @@ function dedup(entities: ExtractedEntity[]): ExtractedEntity[] {
   return [...seen.values()];
 }
 
+/**
+ * Returns true if the string looks like a sentence/fragment rather than a proper entity name.
+ * Uses NLP verb detection + structural heuristics. Used by consolidation to filter garbage entities.
+ *
+ * Deliberately permissive on gray-area cases ("same location as adam") — the LLM consolidation
+ * pass handles those. This function only catches clear non-entities.
+ */
+export function isGarbageEntityName(s: string): boolean {
+  if (!s || s.trim().length === 0) return true;
+
+  // Phone numbers are valid entity values — exempt early
+  if (/^\+?[\d\s\-().]{7,20}$/.test(s.trim())) return false;
+
+  // ── Structural checks (fast, no NLP needed) ───────────────────────────
+  // Markdown artifacts
+  if (s.startsWith("**") || s.startsWith("- ") || s.startsWith("* ")) return true;
+  // Code / special chars
+  if (s.includes("`") || s.includes("→") || s.includes("\n")) return true;
+  // Em-dash separators and comma lists (addresses, enumerations)
+  if (s.includes(" — ") || s.includes(", ")) return true;
+  // Concatenated items
+  if (s.includes(" + ")) return true;
+  // Sentence break: ". Capital"
+  if (/\. [A-Z]/.test(s)) return true;
+  // Date/time stamps
+  if (/^\d{4}-\d{2}-\d{2}/.test(s) || /^\d{1,2}:\d{2}\s*(am|pm)/i.test(s)) return true;
+  // Market/session IDs: long digit runs mixed with underscores/colons (not phone numbers)
+  if (/\d{6,}/.test(s) && /[_:a-z]{3,}/.test(s)) return true;
+  // Parenthetical with multiple words = description, not nickname
+  // "(monty)" is fine, "(quant finance)" is not
+  if (/\([^)]*\s[^)]+\)/.test(s)) return true;
+  // Colon that isn't part of a URL or phone number
+  if (s.includes(":") && !/^https?:\/\//.test(s) && !/^\+?[\d\s\-().:]+$/.test(s)) return true;
+
+  // ── NLP checks ───────────────────────────────────────────────────────
+  const doc = nlp(s);
+
+  // Has a conjugated verb = sentence or sentence fragment
+  // e.g. "what adam experiences", "delegation added to soul.md"
+  if (doc.verbs().length > 0) return true;
+
+  // Starts with question/relative word
+  if (/^(what|where|when|who|how|which|whether)\s/i.test(s)) return true;
+
+  return false;
+}
+
 export function extractEntities(
   text: string,
   graph?: GraphDB
