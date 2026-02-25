@@ -575,7 +575,7 @@ program
 
       // Show some garbage candidates
       const garbage = sorted.filter(e =>
-        e.name.length > 80 || e.name.includes("{") || e.name.includes("<") ||
+        e.name.length > 50 || e.name.includes("{") || e.name.includes("<") ||
         e.name.includes("//") || e.name.includes(".jsonl") || e.name.includes("```")
       );
       if (garbage.length > 0) {
@@ -691,8 +691,26 @@ program
           continue;
         }
 
-        // Very long garbage entities (likely extracted code/file paths)
-        if (triple.object.length > 200 || triple.subject.length > 200) {
+        // Markdown artifacts — sentences masquerading as entities
+        const isSentenceLike = (s: string) =>
+          s.startsWith("**") || s.startsWith("- ") || s.startsWith("* ") ||
+          s.includes("`") || s.includes("→") || s.includes("\n") ||
+          /\. [A-Z]/.test(s);  // sentence break: period + space + capital letter
+
+        if (isSentenceLike(triple.subject) || isSentenceLike(triple.object)) {
+          if (opts.verbose) {
+            console.log(`  [SENTENCE]    #${triple.id}: ${triple.subject.substring(0, 60)} -[${triple.predicate}]-> ${triple.object.substring(0, 60)}`);
+          }
+          if (!opts.dryRun) db.rejectTriple(triple.id);
+          autoRejectedTriples++;
+          continue;
+        }
+
+        // Reject if subject or object looks like a sentence (too long or too many words)
+        const subjectWordCount = triple.subject.split(/\s+/).length;
+        const objectWordCount = triple.object.split(/\s+/).length;
+        if (triple.object.length > 60 || triple.subject.length > 60 ||
+            subjectWordCount > 6 || objectWordCount > 6) {
           if (opts.verbose) {
             console.log(`  [TOO-LONG]    #${triple.id}: ${triple.subject.substring(0, 60)}...`);
           }

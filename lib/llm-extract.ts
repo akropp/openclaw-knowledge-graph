@@ -82,7 +82,14 @@ Rules:
 - Normalize names (full names when known)
 - Skip vague or uncertain relationships
 - Skip entities that are code, file paths, or technical artifacts
-- Return one JSON object per line, no other text`;
+- Return one JSON object per line, no other text
+
+ENTITY NAME RULES — entity names must be SHORT proper nouns (1-5 words max):
+- ✓ "Adam Kropp", "Emily Kropp", "LIM College", "Boston University", "New York City"
+- ✗ NEVER use full sentences as entity names
+- ✗ NEVER use markdown bullets, code snippets, or descriptions as entity names
+- ✗ NEVER use more than 5 words for subject or object
+- If you can't express a relationship with short proper noun entities, SKIP IT`;
 
 /**
  * Extract triples from text using Ollama LLM
