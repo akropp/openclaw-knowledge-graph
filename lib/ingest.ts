@@ -97,19 +97,195 @@ function extractTextFromContent(content: any): string {
   return "";
 }
 
+interface Triple {
+  subject: string;
+  predicate: string;
+  object: string;
+  confidence: number;
+}
+
+interface Property {
+  entity: string;
+  key: string;
+  value: string;
+}
+
+/**
+ * Extract relationship patterns from text containing multiple entities
+ */
+function extractRelationships(
+  text: string,
+  entities: Array<{ name: string; type: string; confidence: number }>
+): { triples: Triple[]; properties: Property[] } {
+  const triples: Triple[] = [];
+  const properties: Property[] = [];
+
+  if (entities.length < 1) return { triples, properties };
+
+  const textLower = text.toLowerCase();
+
+  // Pattern 1: "X is Y's [relationship]"
+  for (const entity1 of entities) {
+    const regex1 = new RegExp(
+      `${entity1.name}\\s+is\\s+([A-Z][a-z]+(?:\\s[A-Z][a-z]+)?)'s\\s+(\\w+)`,
+      "gi"
+    );
+    for (const match of text.matchAll(regex1)) {
+      const relatedEntity = match[1];
+      const relationship = match[2].toLowerCase();
+      triples.push({
+        subject: entity1.name,
+        predicate: `${relationship}_of`,
+        object: relatedEntity,
+        confidence: 0.85,
+      });
+    }
+  }
+
+  // Pattern 2: "X works at Y" / "X lives in Y" / "X studies at Y" / "X goes to Y" / "X attends Y"
+  const workRelations = [
+    { pattern: /(\w+(?:\s+\w+)?)\s+works\s+at\s+([A-Z][\w\s]+)/gi, predicate: "works_at" },
+    { pattern: /(\w+(?:\s+\w+)?)\s+lives\s+in\s+([A-Z][\w\s]+)/gi, predicate: "lives_in" },
+    { pattern: /(\w+(?:\s+\w+)?)\s+(?:studies|goes|attends)\s+(?:at|to)\s+([A-Z][\w\s]+)/gi, predicate: "studies_at" },
+  ];
+
+  for (const { pattern, predicate } of workRelations) {
+    for (const match of text.matchAll(pattern)) {
+      const subject = match[1].trim();
+      const object = match[2].trim();
+      // Check if both are in our entity list
+      const subjectEntity = entities.find((e) => e.name.toLowerCase() === subject.toLowerCase());
+      const objectEntity = entities.find((e) => e.name.toLowerCase() === object.toLowerCase());
+      
+      if (subjectEntity && objectEntity) {
+        triples.push({
+          subject: subjectEntity.name,
+          predicate,
+          object: objectEntity.name,
+          confidence: 0.9,
+        });
+      }
+    }
+  }
+
+  // Pattern 3: "X is dating Y" / "X's boyfriend/girlfriend Y"
+  const relationshipPatterns = [
+    { pattern: /(\w+(?:\s+\w+)?)\s+is\s+dating\s+([A-Z][\w\s]+)/gi, predicate: "dating" },
+    { pattern: /(\w+(?:\s+\w+)?)'s\s+(?:boyfriend|girlfriend)\s+(?:is\s+)?([A-Z][\w\s]+)/gi, predicate: "dating" },
+    { pattern: /(\w+(?:\s+\w+)?)\s+is\s+married\s+to\s+([A-Z][\w\s]+)/gi, predicate: "married_to" },
+    { pattern: /(\w+(?:\s+\w+)?)'s\s+(?:wife|husband)\s+(?:is\s+)?([A-Z][\w\s]+)/gi, predicate: "married_to" },
+  ];
+
+  for (const { pattern, predicate } of relationshipPatterns) {
+    for (const match of text.matchAll(pattern)) {
+      const subject = match[1].trim();
+      const object = match[2].trim();
+      const subjectEntity = entities.find((e) => e.name.toLowerCase() === subject.toLowerCase());
+      const objectEntity = entities.find((e) => e.name.toLowerCase() === object.toLowerCase());
+      
+      if (subjectEntity && objectEntity) {
+        triples.push({
+          subject: subjectEntity.name,
+          predicate,
+          object: objectEntity.name,
+          confidence: 0.85,
+        });
+      }
+    }
+  }
+
+  // Pattern 4: "X is [age]" or "X is [age] years old"
+  for (const entity of entities) {
+    if (entity.type === "person") {
+      const agePattern = new RegExp(
+        `${entity.name}\\s+is\\s+(\\d+)(?:\\s+years\\s+old)?`,
+        "gi"
+      );
+      for (const match of text.matchAll(agePattern)) {
+        properties.push({
+          entity: entity.name,
+          key: "age",
+          value: match[1],
+        });
+      }
+    }
+  }
+
+  // Pattern 5: "X's phone is Y" / "X's number is Y"
+  for (const entity of entities) {
+    if (entity.type === "person") {
+      const phonePattern = new RegExp(
+        `${entity.name}'s\\s+(?:phone|number)\\s+is\\s+([\\d-()]+)`,
+        "gi"
+      );
+      for (const match of text.matchAll(phonePattern)) {
+        properties.push({
+          entity: entity.name,
+          key: "phone",
+          value: match[1],
+        });
+      }
+    }
+  }
+
+  return { triples, properties };
+}
+
+/**
+ * Create association triples for entities that co-occur in the same message
+ * without explicit relationship patterns
+ */
+function createCooccurrenceTriples(
+  entities: Array<{ name: string; type: string; confidence: number }>
+): Triple[] {
+  const triples: Triple[] = [];
+
+  // Only create co-occurrence triples if we have 2+ entities
+  if (entities.length < 2) return triples;
+
+  // Create weak association triples between all pairs
+  for (let i = 0; i < entities.length; i++) {
+    for (let j = i + 1; j < entities.length; j++) {
+      const entity1 = entities[i];
+      const entity2 = entities[j];
+
+      // Only create association if types are different (person-org, person-place, etc.)
+      if (entity1.type !== entity2.type) {
+        triples.push({
+          subject: entity1.name,
+          predicate: "associated_with",
+          object: entity2.name,
+          confidence: 0.5,
+        });
+      }
+    }
+  }
+
+  return triples;
+}
+
 // Process a single session file (line by line to handle large files)
-// Collects entities in memory, then batch-writes them in one transaction.
+// Collects entities AND triples in memory, then batch-writes everything.
 async function processSessionFile(
   graph: GraphDB,
   filePath: string,
   opts: IngestOptions
-): Promise<{ messagesProcessed: number; entitiesAdded: number; errors: string[] }> {
-  const stats: { messagesProcessed: number; entitiesAdded: number; errors: string[] } = { 
+): Promise<{ messagesProcessed: number; entitiesAdded: number; triplesAdded: number; propertiesAdded: number; errors: string[] }> {
+  const stats = { 
     messagesProcessed: 0, 
-    entitiesAdded: 0, 
-    errors: [] 
+    entitiesAdded: 0,
+    triplesAdded: 0,
+    propertiesAdded: 0,
+    errors: [] as string[]
   };
-  const pendingEntities: Array<{ name: string; type: string }> = [];
+
+  // Collect everything in memory
+  const allEntities = new Map<string, { name: string; type: string }>();
+  const allTriples: Triple[] = [];
+  const allProperties: Property[] = [];
+
+  // Track entity co-occurrence across the entire session
+  const cooccurrenceMap = new Map<string, Map<string, number>>();
 
   await new Promise<void>((resolve) => {
     const fileStream = createReadStream(filePath, { encoding: "utf-8" });
@@ -131,9 +307,47 @@ async function processSessionFile(
 
             // Extract entities from the message text
             const entities = extractEntities(text, graph);
+            
+            // Collect entities
             for (const entity of entities) {
-              pendingEntities.push(entity);
-              stats.entitiesAdded++;
+              const key = entity.name.toLowerCase();
+              if (!allEntities.has(key)) {
+                allEntities.set(key, { name: entity.name, type: entity.type });
+                stats.entitiesAdded++;
+              }
+            }
+
+            // Extract explicit relationships
+            const { triples, properties } = extractRelationships(text, entities);
+            allTriples.push(...triples);
+            stats.triplesAdded += triples.length;
+            
+            allProperties.push(...properties);
+            stats.propertiesAdded += properties.length;
+
+            // Create weak co-occurrence triples
+            const cooccurrenceTriples = createCooccurrenceTriples(entities);
+            allTriples.push(...cooccurrenceTriples);
+            stats.triplesAdded += cooccurrenceTriples.length;
+
+            // Track co-occurrence for strengthening relationships
+            for (let i = 0; i < entities.length; i++) {
+              for (let j = i + 1; j < entities.length; j++) {
+                const key1 = entities[i].name.toLowerCase();
+                const key2 = entities[j].name.toLowerCase();
+                
+                if (!cooccurrenceMap.has(key1)) {
+                  cooccurrenceMap.set(key1, new Map());
+                }
+                const map1 = cooccurrenceMap.get(key1)!;
+                map1.set(key2, (map1.get(key2) || 0) + 1);
+
+                if (!cooccurrenceMap.has(key2)) {
+                  cooccurrenceMap.set(key2, new Map());
+                }
+                const map2 = cooccurrenceMap.get(key2)!;
+                map2.set(key1, (map2.get(key1) || 0) + 1);
+              }
             }
 
             if (opts.verbose && stats.messagesProcessed % 100 === 0) {
@@ -156,11 +370,61 @@ async function processSessionFile(
     });
   });
 
-  // Batch-write all entities from this file in one transaction
-  if (!opts.dryRun && pendingEntities.length > 0) {
+  // Add strengthened relationships based on session-wide co-occurrence
+  for (const [entity1Key, cooccurMap] of cooccurrenceMap.entries()) {
+    for (const [entity2Key, count] of cooccurMap.entries()) {
+      // If entities co-occur 3+ times, strengthen the relationship
+      if (count >= 3) {
+        const entity1 = allEntities.get(entity1Key);
+        const entity2 = allEntities.get(entity2Key);
+        
+        if (entity1 && entity2 && entity1.type !== entity2.type) {
+          // Check if we already have a triple for this pair
+          const existingTriple = allTriples.find(
+            (t) =>
+              (t.subject.toLowerCase() === entity1Key && t.object.toLowerCase() === entity2Key) ||
+              (t.subject.toLowerCase() === entity2Key && t.object.toLowerCase() === entity1Key)
+          );
+
+          if (existingTriple) {
+            // Boost confidence based on co-occurrence count
+            existingTriple.confidence = Math.min(0.9, existingTriple.confidence + (count * 0.05));
+          } else {
+            // Create a new strengthened association
+            allTriples.push({
+              subject: entity1.name,
+              predicate: "associated_with",
+              object: entity2.name,
+              confidence: Math.min(0.8, 0.5 + (count * 0.05)),
+            });
+            stats.triplesAdded++;
+          }
+        }
+      }
+    }
+  }
+
+  // Batch-write all entities and triples from this file in one transaction
+  if (!opts.dryRun && (allEntities.size > 0 || allTriples.length > 0)) {
     graph.batch(() => {
-      for (const entity of pendingEntities) {
+      // Write entities
+      for (const entity of allEntities.values()) {
         graph.addEntity(entity.name, entity.type);
+      }
+
+      // Write triples
+      for (const triple of allTriples) {
+        graph.addTriple(triple.subject, triple.predicate, triple.object, {
+          confidence: triple.confidence,
+          source: `session:${filePath.split("/").slice(-1)[0]}`,
+        });
+      }
+
+      // Write properties
+      for (const prop of allProperties) {
+        graph.addProperty(prop.entity, normalizePredicate(prop.key), prop.value, {
+          source: `session:${filePath.split("/").slice(-1)[0]}`,
+        });
       }
     });
   }
@@ -202,11 +466,13 @@ export async function ingestSessions(
       stats.sessionsProcessed++;
       stats.messagesProcessed += fileStats.messagesProcessed;
       stats.entitiesAdded += fileStats.entitiesAdded;
+      stats.triplesAdded += fileStats.triplesAdded;
+      stats.propertiesAdded += fileStats.propertiesAdded;
       stats.errors.push(...fileStats.errors);
 
       if (opts.verbose) {
         console.log(
-          `    ✓ ${fileStats.messagesProcessed} messages, ${fileStats.entitiesAdded} entities`
+          `    ✓ ${fileStats.messagesProcessed} messages, ${fileStats.entitiesAdded} entities, ${fileStats.triplesAdded} triples`
         );
       }
     } catch (err) {
@@ -614,8 +880,10 @@ export async function ingestAll(
   combined.sessionsProcessed += sessionStats.sessionsProcessed;
   combined.messagesProcessed += sessionStats.messagesProcessed;
   combined.entitiesAdded += sessionStats.entitiesAdded;
+  combined.triplesAdded += sessionStats.triplesAdded;
+  combined.propertiesAdded += sessionStats.propertiesAdded;
   combined.errors.push(...sessionStats.errors);
-  console.log(`  Sessions done: ${sessionStats.sessionsProcessed} files, ${sessionStats.messagesProcessed} messages, ${sessionStats.entitiesAdded} entities`);
+  console.log(`  Sessions done: ${sessionStats.sessionsProcessed} files, ${sessionStats.messagesProcessed} messages, ${sessionStats.entitiesAdded} entities, ${sessionStats.triplesAdded} triples`);
 
   // Ingest markdown
   console.log("\n=== Ingesting Markdown Files ===");
