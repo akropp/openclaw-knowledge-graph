@@ -1,0 +1,8 @@
+{
+  "dbPath": "~/shared/graph.db",
+  "maxHops": 2,
+  "llm": {
+    "baseUrl": "http://mac-mini.tailcd0984.ts.net:11434",
+    "model": "qwen2.5:14b"
+  }
+}

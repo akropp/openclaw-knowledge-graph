@@ -17,6 +17,48 @@ An [OpenClaw](https://github.com/openclaw) plugin that provides a shared knowled
 npm install
 ```
 
+## Configuration
+
+The knowledge graph CLI reads configuration from `~/.openclaw/kg.json`. This file is optional but recommended for setting defaults.
+
+**Example configuration:**
+
+```json
+{
+  "dbPath": "~/shared/graph.db",
+  "maxHops": 2,
+  "llm": {
+    "baseUrl": "http://mac-mini.tailcd0984.ts.net:11434",
+    "model": "qwen2.5:14b"
+  }
+}
+```
+
+**Configuration options:**
+
+- `dbPath` — Default database path (CLI `--db` flag overrides this)
+- `maxHops` — Default number of hops for graph traversal queries
+- `llm.baseUrl` — Ollama or OpenAI-compatible API endpoint for LLM extraction
+- `llm.model` — Model name to use for LLM extraction
+
+**Creating a config file:**
+
+```bash
+# Interactive setup
+kg init
+
+# Or manually create ~/.openclaw/kg.json
+cp kg.json.example ~/.openclaw/kg.json
+# Edit ~/.openclaw/kg.json with your settings
+```
+
+**Notes:**
+
+- If `llm` configuration is present, LLM extraction is enabled by default for ingestion
+- If `llm` is not configured, you must pass `--llm <url>` explicitly to use LLM features
+- CLI flags always override config file values
+- No environment variables are used; all configuration is file-based
+
 ## Usage
 
 ### As a CLI tool (skill-only mode)

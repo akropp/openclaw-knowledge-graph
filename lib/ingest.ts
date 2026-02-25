@@ -274,6 +274,10 @@ async function processSessionFileWithLLM(
   filePath: string,
   opts: IngestOptions
 ): Promise<{ messagesProcessed: number; entitiesAdded: number; triplesAdded: number; propertiesAdded: number; errors: string[] }> {
+  if (!opts.ollamaUrl || !opts.model) {
+    throw new Error("LLM extraction requires ollamaUrl and model to be specified");
+  }
+
   const stats = {
     messagesProcessed: 0,
     entitiesAdded: 0,
@@ -342,8 +346,8 @@ async function processSessionFileWithLLM(
 
     try {
       const triples = await extractTriplesWithLLM(chunk, {
-        ollamaUrl: opts.ollamaUrl,
-        model: opts.model,
+        ollamaUrl: opts.ollamaUrl!,
+        model: opts.model!,
         verbose: opts.verbose,
       });
 
