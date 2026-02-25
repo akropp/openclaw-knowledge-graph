@@ -653,6 +653,8 @@ program
       const isSentenceLikeEntity = (s) =>
         s.startsWith("**") || s.startsWith("- ") || s.startsWith("* ") ||
         s.includes("`") || s.includes("→") || s.includes("\n") ||
+        s.includes(" — ") || s.includes(" — ") ||  // em-dash separators
+        s.includes(", ") ||                           // comma-separated lists
         /\. [A-Z]/.test(s) ||
         s.split(/\s+/).length > 6 ||
         s.length > 60;
