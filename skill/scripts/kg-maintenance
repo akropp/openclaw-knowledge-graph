@@ -717,54 +717,9 @@ program
       }
 
       // Auto-detect duplicate entities (name containment)
-      if (!opts.entity) {
-        const allEntities = db.exportAll().entities.filter(e => !e.rejected);
-        const processed = new Set();
-
-        for (let i = 0; i < allEntities.length; i++) {
-          const e1 = allEntities[i];
-          const n1 = e1.name;
-          if (processed.has(n1)) continue;
-
-          for (let j = i + 1; j < allEntities.length; j++) {
-            const e2 = allEntities[j];
-            const n2 = e2.name;
-            if (processed.has(n2)) continue;
-
-            // Auto-merge only person name variants (e.g., "adam" vs "adam kropp")
-            // Non-person entities like "calendar" vs "noah's calendar" are different things
-            if (n1 !== n2 && e1.type === "person" && e2.type === "person") {
-              const words1 = new Set(n1.split(/[\s'-]+/).filter(w => w.length > 1));
-              const words2 = new Set(n2.split(/[\s'-]+/).filter(w => w.length > 1));
-              const shorter = n1.length <= n2.length ? n1 : n2;
-              const longer = n1.length <= n2.length ? n2 : n1;
-              const shorterWords = n1.length <= n2.length ? words1 : words2;
-              const longerWords = n1.length <= n2.length ? words2 : words1;
-
-              // Every word in the shorter name must appear in the longer name
-              const allShorterWordsInLonger = [...shorterWords].every(w => longerWords.has(w));
-              const addedWords = longerWords.size - shorterWords.size;
-
-              if (allShorterWordsInLonger && addedWords <= 2 && addedWords >= 1 && shorterWords.size >= 1) {
-                if (opts.verbose) {
-                  console.log(`  [DUPLICATE]   Merging "${shorter}" into "${longer}"`);
-                }
-                if (!opts.dryRun) {
-                  try {
-                    db.merge(longer, shorter);
-                    autoRejectedEntities++;
-                    processed.add(shorter);
-                  } catch {
-                    // Merge failed — skip
-                  }
-                } else {
-                  autoRejectedEntities++;
-                }
-              }
-            }
-          }
-        }
-      }
+      // Entity dedup is deferred to --llm or --interactive phases
+      // Auto-merge is too error-prone (e.g., "adam" matches both "adam kropp" and "adam deppe")
+      // The LLM can examine triples attached to each entity to determine if they're the same
 
       console.log(`Auto-rejected: ${autoRejectedTriples} triples (garbage values)`);
       if (autoRejectedEntities > 0) {
