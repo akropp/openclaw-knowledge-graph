@@ -447,6 +447,63 @@ export class GraphDB {
     mergeOp();
   }
 
+  /**
+   * Non-destructive merge: copy triples from source to canonical entity, then reject the source.
+   * Original triples are preserved (as rejected) and can be un-rejected if the merge was wrong.
+   */
+  softMerge(canonical: string, source: string): void {
+    const canonName = canonical.toLowerCase().trim();
+    const srcName = source.toLowerCase().trim();
+
+    const e1 = this.db.prepare("SELECT * FROM entities WHERE name = ?").get(canonName) as Entity | undefined;
+    const e2 = this.db.prepare("SELECT * FROM entities WHERE name = ?").get(srcName) as Entity | undefined;
+
+    if (!e1 || !e2) {
+      throw new Error(`Entity not found: ${!e1 ? canonical : source}`);
+    }
+
+    const op = this.db.transaction(() => {
+      // Copy triples from source to canonical (as new triples)
+      const srcTriples = this.db.prepare(
+        `SELECT t.*, e_s.name as subj_name, e_o.name as obj_name
+         FROM triples t
+         JOIN entities e_s ON t.subject_id = e_s.id
+         JOIN entities e_o ON t.object_id = e_o.id
+         WHERE (t.subject_id = ? OR t.object_id = ?) AND t.rejected = 0`
+      ).all(e2.id, e2.id) as any[];
+
+      for (const t of srcTriples) {
+        const newSubject = t.subject_id === e2.id ? canonName : t.subj_name;
+        const newObject = t.object_id === e2.id ? canonName : t.obj_name;
+        // addTriple handles ON CONFLICT — if the canonical triple already exists, it just updates
+        this.addTriple(newSubject, t.predicate, newObject, {
+          confidence: t.confidence,
+          source: `merge:${t.source}`,
+        });
+      }
+
+      // Copy properties
+      const srcProps = this.db.prepare(
+        `SELECT * FROM properties WHERE entity_id = ?`
+      ).all(e2.id) as any[];
+
+      for (const p of srcProps) {
+        this.addProperty(canonName, p.predicate, p.value, {
+          source: `merge:${p.source}`,
+        });
+      }
+
+      // Store alias
+      this.addProperty(canonName, "alias", e2.display_name);
+
+      // Reject source entity and its triples (non-destructive)
+      this.db.prepare(`UPDATE entities SET rejected = 1, updated_at = datetime('now') WHERE id = ?`).run(e2.id);
+      this.db.prepare(`UPDATE triples SET rejected = 1, updated_at = datetime('now') WHERE subject_id = ? OR object_id = ?`).run(e2.id, e2.id);
+    });
+
+    op();
+  }
+
   prune(opts?: PruneOpts): string[] {
     const orphans = this.db
       .prepare(
@@ -472,6 +529,11 @@ export class GraphDB {
     }
 
     return names;
+  }
+
+  /** Rebuild the FTS5 index from the entities table */
+  rebuildFts(): void {
+    this.db.exec(`INSERT INTO entities_fts(entities_fts) VALUES('rebuild')`);
   }
 
   stats(): GraphStats {
