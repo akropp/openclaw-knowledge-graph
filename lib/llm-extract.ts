@@ -51,6 +51,7 @@ export interface LLMExtractOptions {
   model: string;
   apiKey?: string;
   verbose?: boolean;
+  timeoutMs?: number;
 }
 
 const SYSTEM_PROMPT = `Extract knowledge triples from this conversation. Return ONLY valid JSON lines, one per triple:
@@ -111,7 +112,7 @@ export async function extractTriplesWithLLM(
         ],
         temperature: 0,
       }),
-      signal: AbortSignal.timeout(120000), // 120s timeout (model loading + inference)
+      signal: AbortSignal.timeout(opts.timeoutMs || 300000), // 120s timeout (model loading + inference)
     });
 
     // Retry on 429 with exponential backoff
@@ -134,7 +135,7 @@ export async function extractTriplesWithLLM(
           ],
           temperature: 0,
         }),
-        signal: AbortSignal.timeout(120000),
+        signal: AbortSignal.timeout(opts.timeoutMs || 300000),
       });
       if (!retry.ok) {
         throw new Error(`LLM API error after retry: ${retry.status} ${retry.statusText}`);
