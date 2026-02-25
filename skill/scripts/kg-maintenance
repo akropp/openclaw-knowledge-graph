@@ -643,6 +643,7 @@ program
     let autoRejectedEntities = 0;
     let llmRejected = 0;
     let llmFixed = 0;
+    let llmUnsure = 0;
     let interactiveRejected = 0;
     let kept = 0;
 
@@ -970,19 +971,22 @@ ${contextTriples.map(t => `  ✓ ${t.subject} -[${t.predicate}]-> ${t.object}`).
 
 For each NEW triple (listed below), respond with:
 - "keep" — correct and useful
-- "reject" — incorrect, nonsensical, low-value, duplicate, or contradicts a verified triple
+- "reject" — clearly incorrect, factually impossible, or obviously nonsensical (high confidence wrong)
 - "fix" — roughly correct but needs correction (provide the corrected triple)
+- "unsure" — plausible but you lack confidence; leave it active for human review
 
-When you see contradictions (e.g., "dating" and "married_to" for the same pair), keep the correct one and reject the other.
-When you see wrong directionality (parent marked as child), fix it.
-When a new triple duplicates or contradicts an already-verified triple, reject the new one.
+**Default to "keep" or "unsure" when in doubt. Only use "reject" when you are highly confident the triple is wrong.**
+Do NOT reject triples just because they seem unusual or you don't recognize the subject — the graph contains personal/private data you may not know.
+When you see contradictions (e.g., "dating" and "married_to" for the same pair), keep the most plausible one and reject only the clearly wrong one.
+When you see wrong directionality (e.g., parent marked as child), use "fix" rather than "reject".
+When a new triple duplicates an already-verified triple, reject the duplicate.
 
 Entities being reviewed: ${entityNames}
 ${contextBlock}
 NEW triples to judge:
 ${JSON.stringify(batchTriples.map(t => ({ id: t.id, subject: t.subject, predicate: t.predicate, object: t.object })), null, 2)}
 
-Respond with ONLY a JSON array: [{id: <id>, action: "keep"|"reject"|"fix", fix?: {subject, predicate, object}, reason?: "brief explanation"}]`;
+Respond with ONLY a JSON array: [{id: <id>, action: "keep"|"reject"|"fix"|"unsure", fix?: {subject, predicate, object}, reason?: "brief explanation"}]`;
 
             try {
               const decisions = await llmCall(prompt);
@@ -1011,6 +1015,13 @@ Respond with ONLY a JSON array: [{id: <id>, action: "keep"|"reject"|"fix", fix?:
                   }
                 } else if (d.action === "keep") {
                   keptIds.push(d.id);
+                } else if (d.action === "unsure") {
+                  llmUnsure++;
+                  if (opts.verbose) {
+                    const t = batchTriples.find(b => b.id === d.id);
+                    if (t) console.log(`  [UNSURE] #${t.id}: ${t.subject} -[${t.predicate}]-> ${t.object}${d.reason ? ` (${d.reason})` : ""}`);
+                  }
+                  // Leave triple active but do NOT mark reviewed — flagged for human review
                 }
               }
 
@@ -1044,7 +1055,7 @@ Respond with ONLY a JSON array: [{id: <id>, action: "keep"|"reject"|"fix", fix?:
             await flushTripleBatch();
           }
 
-          console.log(`\nLLM triple review: ${llmRejected} rejected, ${llmFixed} fixed`);
+          console.log(`\nLLM triple review: ${llmRejected} rejected, ${llmFixed} fixed, ${llmUnsure} flagged for human review`);
         }
       }
 
@@ -1118,6 +1129,9 @@ Respond with ONLY a JSON array: [{id: <id>, action: "keep"|"reject"|"fix", fix?:
       if (opts.llm) {
         console.log(`LLM-rejected:           ${llmRejected} triples`);
         console.log(`LLM-fixed:              ${llmFixed} triples`);
+        if (llmUnsure > 0) {
+          console.log(`LLM-unsure (review me): ${llmUnsure} triples (active, not reviewed)`);
+        }
       }
       if (opts.interactive) {
         console.log(`Interactively rejected: ${interactiveRejected} triples`);
