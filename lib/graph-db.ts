@@ -108,6 +108,13 @@ CREATE TABLE IF NOT EXISTS properties (
   UNIQUE(entity_id, key)
 );
 
+CREATE TABLE IF NOT EXISTS ingest_state (
+  file_path TEXT PRIMARY KEY,
+  mtime TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  processed_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_triples_subject ON triples(subject_id);
 CREATE INDEX IF NOT EXISTS idx_triples_object ON triples(object_id);
 CREATE INDEX IF NOT EXISTS idx_triples_predicate ON triples(predicate);
@@ -525,6 +532,34 @@ export class GraphDB {
       }
     });
     importOp();
+  }
+
+  getIngestState(filePath: string): { mtime: string; size: number; processedAt: string } | null {
+    const stmt = this.db.prepare("SELECT mtime, size, processed_at FROM ingest_state WHERE file_path = ?");
+    const row = stmt.get(filePath) as { mtime: string; size: number; processed_at: string } | undefined;
+    if (!row) return null;
+    return { mtime: row.mtime, size: row.size, processedAt: row.processed_at };
+  }
+
+  setIngestState(filePath: string, mtime: string, size: number): void {
+    const stmt = this.db.prepare(`
+      INSERT INTO ingest_state (file_path, mtime, size, processed_at)
+      VALUES (?, ?, ?, datetime('now'))
+      ON CONFLICT(file_path) DO UPDATE SET
+        mtime = excluded.mtime,
+        size = excluded.size,
+        processed_at = datetime('now')
+    `);
+    stmt.run(filePath, mtime, size);
+  }
+
+  clearIngestState(): void {
+    this.db.prepare("DELETE FROM ingest_state").run();
+  }
+
+  getIngestStats(): { filesProcessed: number } {
+    const row = this.db.prepare("SELECT COUNT(*) as count FROM ingest_state").get() as { count: number };
+    return { filesProcessed: row.count };
   }
 
   close(): void {

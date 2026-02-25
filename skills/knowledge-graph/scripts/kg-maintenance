@@ -273,11 +273,13 @@ program
   )
   .option("--llm [url]", "Use LLM extraction instead of NLP (URL optional if configured in ~/.openclaw/kg.json)")
   .option("--llm-model <model>", "LLM model to use (overrides config)")
+  .option("--llm-api-key <key>", "API key for cloud LLM providers (overrides config)")
   .option("--dry-run", "Show what would be ingested without adding to graph")
   .option("--verbose", "Show detailed progress")
   .action(async (opts) => {
     const { ingestSessions, ingestMarkdown, ingestFactmem, ingestAll } = await import("../../../dist/lib/ingest.js");
     const db = openDb(program.opts());
+    const config = loadConfig();
     const llmConfig = getLLMConfig();
 
     try {
@@ -329,10 +331,14 @@ program
         useLLM,
         ollamaUrl,
         model,
+        apiKey: opts.llmApiKey || config.llm?.apiKey,
       };
 
       if (ingestOpts.useLLM && opts.verbose) {
         console.log(`LLM extraction enabled: ${ingestOpts.ollamaUrl} (model: ${ingestOpts.model})`);
+        if (ingestOpts.apiKey) {
+          console.log(`Using API key: ${ingestOpts.apiKey.substring(0, 8)}...`);
+        }
       }
 
       switch (opts.source.toLowerCase()) {
@@ -399,9 +405,11 @@ program
   .option("--limit <n>", "Max entities to show", "50")
   .option("--llm [url]", "Use LLM extraction instead of NLP (URL optional if configured in ~/.openclaw/kg.json)")
   .option("--llm-model <model>", "LLM model to use (overrides config)")
+  .option("--llm-api-key <key>", "API key for cloud LLM providers (overrides config)")
   .action(async (file, opts) => {
     const { readFileSync, createReadStream } = await import("node:fs");
     const { createInterface } = await import("node:readline");
+    const config = loadConfig();
     const llmConfig = getLLMConfig();
     const limit = parseInt(opts.limit, 10);
     
@@ -478,6 +486,7 @@ program
         const triples = await extractTriplesWithLLM(chunks[i], {
           ollamaUrl: ollamaUrl,
           model: model,
+          apiKey: opts.llmApiKey || config.llm?.apiKey,
           verbose: true,
         });
         

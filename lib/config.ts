@@ -7,17 +7,16 @@ export const CONFIG_PATH = resolve(homedir(), ".openclaw", "kg.json");
 export interface KGConfig {
   dbPath: string;
   maxHops: number;
-  ingestStatePath?: string;
   llm?: {
     baseUrl?: string;
     model?: string;
+    apiKey?: string;
   };
 }
 
 const DEFAULT_CONFIG: KGConfig = {
   dbPath: resolve(homedir(), ".openclaw", "knowledge-graph.db"),
   maxHops: 2,
-  ingestStatePath: resolve(homedir(), ".openclaw", "kg-ingest-state.json"),
 };
 
 /**
@@ -37,10 +36,10 @@ export function loadConfig(): KGConfig {
     return {
       dbPath: parsed.dbPath ?? DEFAULT_CONFIG.dbPath,
       maxHops: parsed.maxHops ?? DEFAULT_CONFIG.maxHops,
-      ingestStatePath: parsed.ingestStatePath ?? DEFAULT_CONFIG.ingestStatePath,
       llm: parsed.llm ? {
         baseUrl: parsed.llm.baseUrl,
         model: parsed.llm.model,
+        apiKey: parsed.llm.apiKey,
       } : undefined,
     };
   } catch (err) {
@@ -67,10 +66,9 @@ export function saveConfig(config: KGConfig): void {
   const output: any = {
     dbPath,
     maxHops: config.maxHops,
-    ingestStatePath: config.ingestStatePath,
   };
 
-  if (config.llm && (config.llm.baseUrl || config.llm.model)) {
+  if (config.llm && (config.llm.baseUrl || config.llm.model || config.llm.apiKey)) {
     output.llm = config.llm;
   }
 

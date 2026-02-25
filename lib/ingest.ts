@@ -1,7 +1,6 @@
-import { readdirSync, statSync, readFileSync, existsSync, createReadStream, writeFileSync, unlinkSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { readdirSync, statSync, readFileSync, existsSync, createReadStream } from "node:fs";
+import { join } from "node:path";
 import { createInterface } from "node:readline";
-import { mkdirSync } from "node:fs";
 import Database from "better-sqlite3";
 import type { GraphDB } from "./graph-db.js";
 import { extractEntities } from "./entity-extract.js";
@@ -25,62 +24,13 @@ export interface IngestOptions {
   useLLM?: boolean;
   ollamaUrl?: string;
   model?: string;
+  apiKey?: string;
   fresh?: boolean;
-  statePath?: string;
-}
-
-// State file format
-export interface IngestState {
-  version: 1;
-  files: {
-    [filePath: string]: {
-      mtime: string;
-      size: number;
-      processedAt: string;
-    };
-  };
-}
-
-// Load state file
-function loadState(statePath: string): IngestState {
-  if (!existsSync(statePath)) {
-    return { version: 1, files: {} };
-  }
-
-  try {
-    const content = readFileSync(statePath, "utf-8");
-    const state = JSON.parse(content);
-    
-    // Validate version
-    if (state.version !== 1) {
-      console.warn(`Unknown state file version ${state.version}, starting fresh`);
-      return { version: 1, files: {} };
-    }
-    
-    return state;
-  } catch (err) {
-    console.warn(`Failed to load state file: ${err}, starting fresh`);
-    return { version: 1, files: {} };
-  }
-}
-
-// Save state file
-function saveState(statePath: string, state: IngestState): void {
-  try {
-    const dir = dirname(statePath);
-    if (!existsSync(dir)) {
-      mkdirSync(dir, { recursive: true });
-    }
-    
-    writeFileSync(statePath, JSON.stringify(state, null, 2), "utf-8");
-  } catch (err) {
-    console.error(`Failed to save state file: ${err}`);
-  }
 }
 
 // Check if a file needs processing
-function shouldProcessFile(filePath: string, state: IngestState): boolean {
-  const fileState = state.files[filePath];
+function shouldProcessFile(graph: GraphDB, filePath: string): boolean {
+  const fileState = graph.getIngestState(filePath);
   if (!fileState) {
     return true; // File not in state, needs processing
   }
@@ -103,26 +53,12 @@ function shouldProcessFile(filePath: string, state: IngestState): boolean {
 }
 
 // Mark file as processed
-function markFileProcessed(filePath: string, state: IngestState): void {
+function markFileProcessed(graph: GraphDB, filePath: string): void {
   try {
     const stats = statSync(filePath);
-    state.files[filePath] = {
-      mtime: stats.mtime.toISOString(),
-      size: stats.size,
-      processedAt: new Date().toISOString(),
-    };
+    graph.setIngestState(filePath, stats.mtime.toISOString(), stats.size);
   } catch (err) {
     console.error(`Failed to mark file as processed: ${err}`);
-  }
-}
-
-// Delete state file
-export function resetState(statePath: string): void {
-  if (existsSync(statePath)) {
-    unlinkSync(statePath);
-    console.log(`Deleted state file: ${statePath}`);
-  } else {
-    console.log(`State file does not exist: ${statePath}`);
   }
 }
 
@@ -445,10 +381,20 @@ async function processSessionFileWithLLM(
       console.log(`      Chunk ${i + 1}/${chunks.length}...`);
     }
 
+    // Pre-filter: check if chunk has any entities using fast NLP extraction
+    const quickEntities = extractEntities(chunk);
+    if (quickEntities.length === 0) {
+      if (opts.verbose) {
+        console.log(`      Skipping chunk ${i + 1} (no entities detected)`);
+      }
+      continue;
+    }
+
     try {
       const triples = await extractTriplesWithLLM(chunk, {
         ollamaUrl: opts.ollamaUrl!,
         model: opts.model!,
+        apiKey: opts.apiKey,
         verbose: opts.verbose,
       });
 
@@ -700,23 +646,23 @@ export async function ingestSessions(
     console.log(`Found ${sessionFiles.length} session files to process`);
   }
 
-  // Load state (unless --fresh is set)
-  const statePath = opts.statePath || "";
-  let state: IngestState = { version: 1, files: {} };
-  
-  if (statePath && !opts.fresh) {
-    state = loadState(statePath);
+  // Handle --fresh: clear ingest state
+  if (opts.fresh) {
     if (opts.verbose) {
-      console.log(`Loaded state from ${statePath} (${Object.keys(state.files).length} files tracked)`);
+      console.log("Running with --fresh, clearing existing ingest state");
     }
-  } else if (opts.fresh && opts.verbose) {
-    console.log("Running with --fresh, ignoring existing state");
+    if (!opts.dryRun) {
+      graph.clearIngestState();
+    }
+  } else if (opts.verbose) {
+    const stateStats = graph.getIngestStats();
+    console.log(`Found ${stateStats.filesProcessed} files in ingest state`);
   }
 
   // Filter files that need processing
   const filesToProcess: string[] = [];
   for (const filePath of sessionFiles) {
-    if (statePath && !opts.fresh && !shouldProcessFile(filePath, state)) {
+    if (!opts.fresh && !shouldProcessFile(graph, filePath)) {
       stats.filesSkipped!++;
     } else {
       filesToProcess.push(filePath);
@@ -750,10 +696,9 @@ export async function ingestSessions(
       stats.propertiesAdded += fileStats.propertiesAdded;
       stats.errors.push(...fileStats.errors);
 
-      // Mark file as processed and save state immediately
-      if (statePath && !opts.dryRun) {
-        markFileProcessed(filePath, state);
-        saveState(statePath, state);
+      // Mark file as processed in database
+      if (!opts.dryRun) {
+        markFileProcessed(graph, filePath);
       }
 
       if (opts.verbose) {

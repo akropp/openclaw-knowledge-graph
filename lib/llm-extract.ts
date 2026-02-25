@@ -11,6 +11,7 @@ export interface LLMTriple {
 export interface LLMExtractOptions {
   ollamaUrl: string;
   model: string;
+  apiKey?: string;
   verbose?: boolean;
 }
 
@@ -48,11 +49,18 @@ export async function extractTriplesWithLLM(
   }
 
   try {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+    
+    // Add Authorization header if apiKey is provided
+    if (opts.apiKey) {
+      headers["Authorization"] = `Bearer ${opts.apiKey}`;
+    }
+
     const response = await fetch(`${ollamaUrl}/v1/chat/completions`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
+      headers,
       body: JSON.stringify({
         model,
         messages: [
