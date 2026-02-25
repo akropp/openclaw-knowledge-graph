@@ -14,6 +14,13 @@ import {
   getConfigValue,
   setConfigValue
 } from "../../../dist/lib/config.js";
+import {
+  ingestSessions,
+  ingestMarkdown,
+  ingestFactmem,
+  ingestAll,
+  resetState
+} from "../../../dist/lib/ingest.js";
 
 function getDbPath(opts) {
   if (opts?.db) return resolve(opts.db);
@@ -468,6 +475,106 @@ program
           console.log();
         }
       }
+    } finally {
+      db.close();
+    }
+  });
+
+program
+  .command("ingest")
+  .description("Ingest data from sessions, markdown, and factmem")
+  .option("--sessions <dir>", "Sessions directory", "/home/clawd/.openclaw/agents")
+  .option("--markdown <paths...>", "Markdown paths to ingest")
+  .option("--factmem <path>", "Factmem database path")
+  .option("--all", "Ingest from all sources (sessions + markdown + factmem)")
+  .option("--dry-run", "Preview without writing to database")
+  .option("--verbose", "Show detailed progress")
+  .option("--llm", "Use LLM for entity extraction")
+  .option("--ollama-url <url>", "Ollama base URL for LLM extraction")
+  .option("--model <name>", "LLM model name")
+  .option("--fresh", "Ignore state file and reprocess everything")
+  .option("--reset-state", "Delete state file and exit")
+  .action(async (opts) => {
+    const config = loadConfig();
+    const statePath = config.ingestStatePath || resolve(homedir(), ".openclaw", "kg-ingest-state.json");
+
+    // Handle --reset-state
+    if (opts.resetState) {
+      resetState(statePath);
+      return;
+    }
+
+    const db = openDb(program.opts());
+    
+    try {
+      const ingestOpts = {
+        dryRun: opts.dryRun,
+        verbose: opts.verbose,
+        useLLM: opts.llm,
+        ollamaUrl: opts.ollamaUrl || config.llm?.baseUrl,
+        model: opts.model || config.llm?.model,
+        fresh: opts.fresh,
+        statePath: statePath,
+      };
+
+      let stats;
+
+      if (opts.all) {
+        // Ingest everything
+        const sessionsDir = opts.sessions;
+        const markdownPaths = opts.markdown || [
+          resolve(homedir(), "shared"),
+          resolve(homedir(), ".openclaw"),
+        ];
+        const factmemPath = opts.factmem || resolve(homedir(), "shared", "facts.db");
+
+        stats = await ingestAll(db, sessionsDir, markdownPaths, factmemPath, ingestOpts);
+      } else if (opts.markdown) {
+        // Just markdown
+        console.log("\n=== Ingesting Markdown Files ===");
+        stats = ingestMarkdown(db, opts.markdown, ingestOpts);
+      } else if (opts.factmem) {
+        // Just factmem
+        console.log("\n=== Ingesting Factmem Database ===");
+        stats = ingestFactmem(db, opts.factmem, ingestOpts);
+      } else {
+        // Default: just sessions
+        console.log("\n=== Ingesting Session Files ===");
+        stats = await ingestSessions(db, opts.sessions, ingestOpts);
+      }
+
+      // Print summary
+      console.log("\n=== Ingest Summary ===");
+      if (stats.sessionsProcessed > 0) {
+        console.log(`Sessions:   ${stats.sessionsProcessed} processed, ${stats.messagesProcessed} messages`);
+      }
+      if (stats.filesProcessed > 0) {
+        console.log(`Markdown:   ${stats.filesProcessed} files`);
+      }
+      if (stats.factsProcessed > 0) {
+        console.log(`Facts:      ${stats.factsProcessed}`);
+      }
+      if (stats.filesSkipped !== undefined && stats.filesSkipped > 0) {
+        console.log(`Skipped:    ${stats.filesSkipped} unchanged files`);
+      }
+      console.log(`Entities:   ${stats.entitiesAdded}`);
+      console.log(`Triples:    ${stats.triplesAdded}`);
+      console.log(`Properties: ${stats.propertiesAdded}`);
+      
+      if (stats.errors.length > 0) {
+        console.log(`\nErrors:     ${stats.errors.length}`);
+        if (opts.verbose) {
+          for (const err of stats.errors.slice(0, 10)) {
+            console.log(`  - ${err}`);
+          }
+          if (stats.errors.length > 10) {
+            console.log(`  ... and ${stats.errors.length - 10} more`);
+          }
+        }
+      }
+    } catch (err) {
+      console.error(`Ingest failed: ${err}`);
+      process.exitCode = 1;
     } finally {
       db.close();
     }
