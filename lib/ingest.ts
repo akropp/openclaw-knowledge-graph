@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import Database from "better-sqlite3";
 import type { GraphDB } from "./graph-db.js";
-import { extractEntities } from "./entity-extract.js";
+import { extractEntities, preprocessText } from "./entity-extract.js";
 import { extractTriplesWithLLM, chunkMessages, type LLMExtractOptions } from "./llm-extract.js";
 
 export interface IngestStats {
@@ -1055,11 +1055,11 @@ function parseStructuredMarkdown(content: string, filePath: string): StructuredD
   return result;
 }
 
-export function ingestMarkdown(
+export async function ingestMarkdown(
   graph: GraphDB,
   paths: string[],
   opts: IngestOptions = {}
-): IngestStats {
+): Promise<IngestStats> {
   const stats: IngestStats = {
     filesProcessed: 0,
     entitiesAdded: 0,
@@ -1081,83 +1081,191 @@ export function ingestMarkdown(
     console.log(`Found ${mdFiles.length} markdown files to process`);
   }
 
-  // Batch all markdown writes in a single transaction
-  graph.batch(() => {
-  for (let i = 0; i < mdFiles.length; i++) {
-    const filePath = mdFiles[i];
-    try {
-      const content = readFileSync(filePath, "utf-8");
-      stats.filesProcessed++;
-      if (i % 20 === 0 || opts.verbose) {
+  if (opts.useLLM) {
+    // ── LLM extraction path ──────────────────────────────────────────────
+    if (!opts.ollamaUrl || !opts.model) {
+      throw new Error("LLM extraction requires ollamaUrl and model to be specified");
+    }
+
+    const chunkSize = opts.chunkSize || 16000;
+
+    for (let i = 0; i < mdFiles.length; i++) {
+      const filePath = mdFiles[i];
+
+      if (opts.verbose || i % 20 === 0) {
         console.log(`  [${i + 1}/${mdFiles.length}] ${filePath.split("/").slice(-3).join("/")}`);
       }
 
-      // Extract entities using the entity extraction library
-      const entities = extractEntities(content, graph);
-      for (const entity of entities) {
-        if (!opts.dryRun) {
-          graph.addEntity(entity.name, entity.type);
+      // Resumability: skip already-processed files (unless --fresh)
+      if (!opts.fresh && !shouldProcessFile(graph, filePath)) {
+        if (opts.verbose) {
+          console.log(`    Skipping (already processed)`);
         }
-        stats.entitiesAdded++;
+        continue;
       }
 
-      // Parse structured markdown
-      const structured = parseStructuredMarkdown(content, filePath);
+      try {
+        const rawContent = readFileSync(filePath, "utf-8");
+        stats.filesProcessed++;
 
-      // Add structured entities
-      for (const entity of structured.entities) {
-        if (!opts.dryRun) {
-          graph.addEntity(entity.name, entity.type);
+        // Clean content via preprocessText
+        const cleanedText = preprocessText(rawContent);
+
+        // NLP pre-filter: skip if no entities detected
+        const quickEntities = extractEntities(cleanedText);
+        if (quickEntities.length === 0) {
+          if (opts.verbose) {
+            console.log(`    Skipping (no entities detected)`);
+          }
+          if (!opts.dryRun) {
+            markFileProcessed(graph, filePath);
+          }
+          continue;
         }
-        stats.entitiesAdded++;
-      }
 
-      // Add triples
-      for (const triple of structured.triples) {
+        // Chunk the file content as a single "document" message
+        const chunks = chunkMessages(
+          [{ role: "document", text: cleanedText }],
+          chunkSize
+        );
+
+        if (opts.verbose) {
+          console.log(`    ${quickEntities.length} entities detected, ${chunks.length} chunk(s)`);
+        }
+
+        // Extract triples from each chunk via LLM
+        const allTriples: Array<{ subject: string; predicate: string; object: string; subject_type?: string; object_type?: string }> = [];
+        for (let c = 0; c < chunks.length; c++) {
+          if (opts.verbose && chunks.length > 1) {
+            console.log(`      chunk ${c + 1}/${chunks.length} (${chunks[c].length} chars)`);
+          }
+          const triples = await extractTriplesWithLLM(chunks[c], {
+            ollamaUrl: opts.ollamaUrl!,
+            model: opts.model!,
+            apiKey: opts.apiKey,
+            verbose: opts.verbose,
+          });
+          allTriples.push(...triples);
+        }
+
+        if (opts.verbose) {
+          console.log(`    Extracted ${allTriples.length} triples`);
+        }
+
+        // Write entities and triples to graph
         if (!opts.dryRun) {
-          graph.addTriple(triple.subject, triple.predicate, triple.object, {
-            confidence: 0.8,
-            source: `markdown:${filePath}`,
+          graph.batch(() => {
+            for (const triple of allTriples) {
+              graph.addEntity(triple.subject, triple.subject_type || "unknown");
+              graph.addEntity(triple.object, triple.object_type || "unknown");
+              graph.addTriple(triple.subject, triple.predicate, triple.object, {
+                confidence: 0.9,
+                source: `markdown:${filePath}`,
+              });
+            }
           });
         }
-        stats.triplesAdded++;
-      }
 
-      // Add properties
-      for (const prop of structured.properties) {
+        stats.entitiesAdded += allTriples.length * 2;
+        stats.triplesAdded += allTriples.length;
+
+        // Mark file as processed
         if (!opts.dryRun) {
-          const predicate = normalizePredicate(prop.key);
-          // Try to add as property if it's a simple value, otherwise as a triple
-          if (prop.value.length < 100 && !prop.value.includes(" ")) {
-            graph.addProperty(prop.entity, predicate, prop.value, {
-              source: `markdown:${filePath}`,
-            });
-            stats.propertiesAdded++;
-          } else {
-            // Complex value might be an entity
-            graph.addTriple(prop.entity, predicate, prop.value, {
-              confidence: 0.7,
-              source: `markdown:${filePath}`,
-            });
-            stats.triplesAdded++;
-          }
-        } else {
-          stats.propertiesAdded++;
+          markFileProcessed(graph, filePath);
         }
-      }
 
-      if (opts.verbose) {
-        console.log(`  ✓ ${filePath}`);
-      }
-    } catch (err) {
-      const error = `Error processing ${filePath}: ${err}`;
-      stats.errors.push(error);
-      if (opts.verbose) {
-        console.error(`  ✗ ${error}`);
+        if (opts.verbose) {
+          console.log(`  ✓ ${filePath}`);
+        }
+      } catch (err) {
+        const error = `Error processing ${filePath}: ${err}`;
+        stats.errors.push(error);
+        if (opts.verbose) {
+          console.error(`  ✗ ${error}`);
+        }
+        // Don't mark as processed on error — allow retry next run
       }
     }
-  }
+  } else {
+    // ── NLP / structured-markdown path (unchanged) ────────────────────────
+    // Batch all markdown writes in a single transaction
+    graph.batch(() => {
+    for (let i = 0; i < mdFiles.length; i++) {
+      const filePath = mdFiles[i];
+      try {
+        const content = readFileSync(filePath, "utf-8");
+        stats.filesProcessed++;
+        if (i % 20 === 0 || opts.verbose) {
+          console.log(`  [${i + 1}/${mdFiles.length}] ${filePath.split("/").slice(-3).join("/")}`);
+        }
+
+        // Extract entities using the entity extraction library
+        const entities = extractEntities(content, graph);
+        for (const entity of entities) {
+          if (!opts.dryRun) {
+            graph.addEntity(entity.name, entity.type);
+          }
+          stats.entitiesAdded++;
+        }
+
+        // Parse structured markdown
+        const structured = parseStructuredMarkdown(content, filePath);
+
+        // Add structured entities
+        for (const entity of structured.entities) {
+          if (!opts.dryRun) {
+            graph.addEntity(entity.name, entity.type);
+          }
+          stats.entitiesAdded++;
+        }
+
+        // Add triples
+        for (const triple of structured.triples) {
+          if (!opts.dryRun) {
+            graph.addTriple(triple.subject, triple.predicate, triple.object, {
+              confidence: 0.8,
+              source: `markdown:${filePath}`,
+            });
+          }
+          stats.triplesAdded++;
+        }
+
+        // Add properties
+        for (const prop of structured.properties) {
+          if (!opts.dryRun) {
+            const predicate = normalizePredicate(prop.key);
+            // Try to add as property if it's a simple value, otherwise as a triple
+            if (prop.value.length < 100 && !prop.value.includes(" ")) {
+              graph.addProperty(prop.entity, predicate, prop.value, {
+                source: `markdown:${filePath}`,
+              });
+              stats.propertiesAdded++;
+            } else {
+              // Complex value might be an entity
+              graph.addTriple(prop.entity, predicate, prop.value, {
+                confidence: 0.7,
+                source: `markdown:${filePath}`,
+              });
+              stats.triplesAdded++;
+            }
+          } else {
+            stats.propertiesAdded++;
+          }
+        }
+
+        if (opts.verbose) {
+          console.log(`  ✓ ${filePath}`);
+        }
+      } catch (err) {
+        const error = `Error processing ${filePath}: ${err}`;
+        stats.errors.push(error);
+        if (opts.verbose) {
+          console.error(`  ✗ ${error}`);
+        }
+      }
+    }
   }); // end batch
+  } // end else (NLP path)
 
   return stats;
 }
@@ -1301,7 +1409,7 @@ export async function ingestAll(
 
   // Ingest markdown
   console.log("\n=== Ingesting Markdown Files ===");
-  const mdStats = ingestMarkdown(graph, markdownPaths, opts);
+  const mdStats = await ingestMarkdown(graph, markdownPaths, opts);
   combined.filesProcessed += mdStats.filesProcessed;
   combined.entitiesAdded += mdStats.entitiesAdded;
   combined.triplesAdded += mdStats.triplesAdded;

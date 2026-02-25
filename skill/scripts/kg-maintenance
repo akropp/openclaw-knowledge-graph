@@ -350,7 +350,7 @@ program
           break;
         case "markdown":
         case "md":
-          stats = ingestMarkdown(db, opts.paths, ingestOpts);
+          stats = await ingestMarkdown(db, opts.paths, ingestOpts);
           break;
         case "factmem":
         case "facts":
