@@ -336,4 +336,114 @@ program
     }
   });
 
+program
+  .command("test-file <file>")
+  .description("Process a single file and show exactly what would be extracted (no DB writes)")
+  .option("--limit <n>", "Max entities to show", "50")
+  .action(async (file, opts) => {
+    const { extractEntities } = await import("../../../dist/lib/entity-extract.js");
+    const { readFileSync, createReadStream } = await import("node:fs");
+    const { createInterface } = await import("node:readline");
+    const limit = parseInt(opts.limit, 10);
+
+    const isSession = file.includes(".jsonl");
+
+    if (isSession) {
+      // Process as session JSONL
+      const rl = createInterface({ input: createReadStream(file, "utf-8"), crlfDelay: Infinity });
+      let msgCount = 0;
+      const allEntities = new Map(); // name -> {type, count, sampleContext}
+
+      for await (const line of rl) {
+        try {
+          const obj = JSON.parse(line);
+          if (obj.type !== "message" || !obj.message) continue;
+          const role = obj.message.role;
+          if (role !== "user" && role !== "assistant") continue;
+
+          let text = obj.message.content;
+          if (Array.isArray(text)) {
+            text = text.filter(b => b.type === "text").map(b => b.text).join("\n");
+          }
+          if (!text || text.length < 10) continue;
+
+          msgCount++;
+          const entities = extractEntities(text);
+          for (const e of entities) {
+            const key = e.name.toLowerCase();
+            const existing = allEntities.get(key);
+            if (existing) {
+              existing.count++;
+            } else {
+              allEntities.set(key, {
+                name: e.name,
+                type: e.type,
+                count: 1,
+                context: text.substring(0, 120).replace(/\n/g, " ")
+              });
+            }
+          }
+        } catch { /* skip bad lines */ }
+      }
+
+      // Sort by count descending
+      const sorted = [...allEntities.values()].sort((a, b) => b.count - a.count);
+
+      console.log(`\nFile: ${file}`);
+      console.log(`Messages processed: ${msgCount}`);
+      console.log(`Unique entities found: ${allEntities.size}`);
+      console.log(`\nTop ${Math.min(limit, sorted.length)} entities:\n`);
+      console.log("  Count  Type          Name");
+      console.log("  -----  ----          ----");
+      for (const e of sorted.slice(0, limit)) {
+        const typeStr = e.type.padEnd(12);
+        const countStr = String(e.count).padStart(5);
+        console.log(`  ${countStr}  ${typeStr}  ${e.name}`);
+      }
+
+      // Show some garbage candidates
+      const garbage = sorted.filter(e =>
+        e.name.length > 80 || e.name.includes("{") || e.name.includes("<") ||
+        e.name.includes("//") || e.name.includes(".jsonl") || e.name.includes("```")
+      );
+      if (garbage.length > 0) {
+        console.log(`\n⚠️  Likely garbage entities (${garbage.length}):`);
+        for (const e of garbage.slice(0, 10)) {
+          console.log(`  - "${e.name.substring(0, 100)}..." (${e.type}, count: ${e.count})`);
+        }
+      }
+
+    } else {
+      // Process as markdown
+      const content = readFileSync(file, "utf-8");
+      const entities = extractEntities(content);
+
+      // Deduplicate
+      const entityMap = new Map();
+      for (const e of entities) {
+        const key = e.name.toLowerCase();
+        const existing = entityMap.get(key);
+        if (existing) {
+          existing.count++;
+        } else {
+          entityMap.set(key, { ...e, count: 1 });
+        }
+      }
+
+      const sorted = [...entityMap.values()].sort((a, b) => b.count - a.count);
+
+      console.log(`\nFile: ${file}`);
+      console.log(`Total extractions: ${entities.length}`);
+      console.log(`Unique entities: ${entityMap.size}`);
+      console.log(`\nTop ${Math.min(limit, sorted.length)} entities:\n`);
+      console.log("  Count  Type          Name");
+      console.log("  -----  ----          ----");
+      for (const e of sorted.slice(0, limit)) {
+        const typeStr = e.type.padEnd(12);
+        const countStr = String(e.count).padStart(5);
+        console.log(`  ${countStr}  ${typeStr}  ${e.name}`);
+      }
+    }
+  });
+
 program.parse();
