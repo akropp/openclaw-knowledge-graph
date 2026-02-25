@@ -494,7 +494,7 @@ export class GraphDB {
       ).all(e2.id) as any[];
 
       for (const p of srcProps) {
-        this.addProperty(canonName, p.predicate, p.value, {
+        this.addProperty(canonName, p.key, p.value, {
           source: `merge:${p.source}`,
         });
       }
