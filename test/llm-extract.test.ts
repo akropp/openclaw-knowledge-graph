@@ -146,7 +146,7 @@ This is not JSON
       expect(triples).toEqual([]);
     });
 
-    it("should use default URL and model when not specified", async () => {
+    it("should use provided URL and model", async () => {
       const mockResponse = {
         choices: [
           {
@@ -163,12 +163,15 @@ This is not JSON
       } as any);
 
       // Use realistic text that won't be stripped
-      await extractTriplesWithLLM("Alice works at Microsoft in Seattle.");
+      await extractTriplesWithLLM("Alice works at Microsoft in Seattle.", {
+        ollamaUrl: "http://localhost:11434",
+        model: "llama2",
+      });
 
       expect(global.fetch).toHaveBeenCalledWith(
-        "http://mac-mini.tailcd0984.ts.net:11434/v1/chat/completions",
+        "http://localhost:11434/v1/chat/completions",
         expect.objectContaining({
-          body: expect.stringContaining('"model":"qwen2.5:14b"'),
+          body: expect.stringContaining('"model":"llama2"'),
         })
       );
     });

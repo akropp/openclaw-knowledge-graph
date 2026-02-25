@@ -1,20 +1,33 @@
 #!/usr/bin/env node
 
-import { resolve } from "node:path";
+import { resolve, dirname } from "node:path";
 import { readFileSync, existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
+import { createInterface } from "node:readline";
 import { program } from "commander";
 import { GraphDB } from "../../../dist/lib/graph-db.js";
 import { fuse } from "../../../dist/lib/rrf.js";
+import { 
+  loadConfig,
+  saveConfig,
+  CONFIG_PATH,
+  getConfigValue,
+  setConfigValue
+} from "../../../dist/lib/config.js";
 
 function getDbPath(opts) {
   if (opts?.db) return resolve(opts.db);
   if (process.env.KG_DB_PATH) return resolve(process.env.KG_DB_PATH);
-  // Default to shared multi-agent database
-  const sharedPath = resolve(homedir(), "shared", "graph.db");
-  const sharedDir = resolve(homedir(), "shared");
-  if (!existsSync(sharedDir)) mkdirSync(sharedDir, { recursive: true });
-  return sharedPath;
+  
+  // Load from config file
+  const config = loadConfig();
+  const dbPath = resolve(config.dbPath);
+  
+  // Ensure parent directory exists
+  const dbDir = dirname(dbPath);
+  if (!existsSync(dbDir)) mkdirSync(dbDir, { recursive: true });
+  
+  return dbPath;
 }
 
 function openDb(opts) {
@@ -26,6 +39,124 @@ program
   .description("Knowledge graph CLI for OpenClaw")
   .version("0.1.0")
   .option("--db <path>", "Database file path");
+
+program
+  .command("init")
+  .description("Initialize knowledge graph configuration interactively")
+  .action(async () => {
+    const rl = createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+
+    const question = (prompt) => new Promise((resolve) => rl.question(prompt, resolve));
+
+    console.log("Knowledge Graph Configuration Setup");
+    console.log("===================================\n");
+
+    // Check if config exists
+    if (existsSync(CONFIG_PATH)) {
+      const answer = await question(`Config file already exists at ${CONFIG_PATH}\nOverwrite? (y/N): `);
+      if (!answer.toLowerCase().startsWith("y")) {
+        console.log("Initialization cancelled.");
+        rl.close();
+        return;
+      }
+    }
+
+    const config = loadConfig(); // Load defaults or existing
+    
+    // Set defaults if not present
+    if (!config.dbPath) {
+      config.dbPath = resolve(homedir(), "shared", "graph.db");
+    }
+    if (!config.maxHops) {
+      config.maxHops = 2;
+    }
+
+    // DB Path
+    const dbPathAnswer = await question(`Database path [${config.dbPath}]: `);
+    if (dbPathAnswer.trim()) {
+      config.dbPath = dbPathAnswer.trim();
+    }
+
+    // Max Hops
+    const maxHopsAnswer = await question(`Max hops for queries [${config.maxHops}]: `);
+    if (maxHopsAnswer.trim()) {
+      config.maxHops = parseInt(maxHopsAnswer.trim(), 10);
+    }
+
+    // LLM Configuration
+    const llmEnabled = await question("Enable LLM extraction? (y/N): ");
+    if (llmEnabled.toLowerCase().startsWith("y")) {
+      if (!config.llm) config.llm = {};
+
+      const baseUrl = await question("LLM base URL [http://mac-mini.tailcd0984.ts.net:11434]: ");
+      config.llm.baseUrl = baseUrl.trim() || "http://mac-mini.tailcd0984.ts.net:11434";
+
+      const model = await question("LLM model [qwen2.5:14b]: ");
+      config.llm.model = model.trim() || "qwen2.5:14b";
+    } else {
+      delete config.llm;
+    }
+
+    saveConfig(config);
+    console.log(`\n✓ Configuration saved to ${CONFIG_PATH}`);
+    rl.close();
+  });
+
+program
+  .command("config")
+  .description("View or modify configuration")
+  .argument("[subcommand]", "Subcommand: get, set, path")
+  .argument("[key]", "Config key (for get/set)")
+  .argument("[value]", "Config value (for set)")
+  .action((subcommand, key, value) => {
+    const config = loadConfig();
+
+    if (!subcommand) {
+      // No subcommand: print current config
+      console.log(JSON.stringify(config, null, 2));
+      return;
+    }
+
+    switch (subcommand) {
+      case "get":
+        if (!key) {
+          console.error("Usage: kg config get <key>");
+          process.exitCode = 1;
+          return;
+        }
+        const val = getConfigValue(config, key);
+        if (val === undefined) {
+          console.error(`Key "${key}" not found`);
+          process.exitCode = 1;
+        } else {
+          console.log(typeof val === "object" ? JSON.stringify(val, null, 2) : val);
+        }
+        break;
+
+      case "set":
+        if (!key || value === undefined) {
+          console.error("Usage: kg config set <key> <value>");
+          process.exitCode = 1;
+          return;
+        }
+        setConfigValue(config, key, value);
+        saveConfig(config);
+        console.log(`✓ Set ${key} = ${value}`);
+        break;
+
+      case "path":
+        console.log(CONFIG_PATH);
+        break;
+
+      default:
+        console.error(`Unknown config subcommand: ${subcommand}`);
+        console.error("Valid subcommands: get, set, path");
+        process.exitCode = 1;
+    }
+  });
 
 program
   .command("add <subject> <predicate> <object>")

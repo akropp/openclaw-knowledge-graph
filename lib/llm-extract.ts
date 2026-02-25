@@ -9,13 +9,10 @@ export interface LLMTriple {
 }
 
 export interface LLMExtractOptions {
-  ollamaUrl?: string;
-  model?: string;
+  ollamaUrl: string;
+  model: string;
   verbose?: boolean;
 }
-
-const DEFAULT_OLLAMA_URL = "http://mac-mini.tailcd0984.ts.net:11434";
-const DEFAULT_MODEL = "qwen2.5:14b";
 
 const SYSTEM_PROMPT = `Extract knowledge triples from this conversation. Return ONLY valid JSON lines, one per triple:
 {"subject":"Emily Kropp","predicate":"studies_at","object":"LIM College","subject_type":"person","object_type":"organization"}
@@ -31,13 +28,14 @@ Rules:
 
 /**
  * Extract triples from text using Ollama LLM
+ * @param text - Text to extract triples from
+ * @param opts - LLM extraction options (ollamaUrl and model are required)
  */
 export async function extractTriplesWithLLM(
   text: string,
-  opts: LLMExtractOptions = {}
+  opts: LLMExtractOptions
 ): Promise<LLMTriple[]> {
-  const ollamaUrl = opts.ollamaUrl || DEFAULT_OLLAMA_URL;
-  const model = opts.model || DEFAULT_MODEL;
+  const { ollamaUrl, model } = opts;
 
   // Clean text before sending to LLM (remove code, markdown, technical artifacts)
   const cleanedText = preprocessText(text);

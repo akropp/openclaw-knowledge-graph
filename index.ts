@@ -1,6 +1,6 @@
 import { resolve } from "node:path";
-import { existsSync, mkdirSync } from "node:fs";
 import { GraphDB } from "./lib/graph-db.js";
+import { loadConfig } from "./lib/config.js";
 
 /**
  * OpenClaw Knowledge Graph Plugin
@@ -8,8 +8,8 @@ import { GraphDB } from "./lib/graph-db.js";
  * Registers a `knowledge_graph` tool that agents can use to query, add,
  * and search a shared SQLite-backed knowledge graph.
  *
- * For auto-injection / fusion, use the skill CLI (kg, kg-maintenance)
- * or configure fusion sources in the plugin config.
+ * Configuration is read from ~/.openclaw/kg.json
+ * Use `kg init` or `kg config` to manage settings.
  */
 
 export interface KnowledgeGraphConfig {
@@ -17,22 +17,11 @@ export interface KnowledgeGraphConfig {
   maxHops?: number;
 }
 
-function getDbPath(config: KnowledgeGraphConfig): string {
-  if (config.dbPath) return resolve(config.dbPath);
-  // Default: shared multi-agent database
-  const sharedDir = resolve(
-    process.env.HOME || "/home/clawd",
-    "shared",
-  );
-  if (!existsSync(sharedDir)) mkdirSync(sharedDir, { recursive: true });
-  return resolve(sharedDir, "graph.db");
-}
-
 // Plugin entry point — matches OpenClaw's real plugin API
 export default function register(api: any): void {
-  const config: KnowledgeGraphConfig = api.config ?? {};
-  const dbPath = getDbPath(config);
-  const graph = new GraphDB(dbPath);
+  // Load config from ~/.openclaw/kg.json instead of gateway plugin config
+  const config = loadConfig();
+  const graph = new GraphDB(config.dbPath);
 
   api.registerTool({
     name: "knowledge_graph",
@@ -115,7 +104,7 @@ export default function register(api: any): void {
           case "query": {
             const results = graph.query(
               params.entity as string,
-              (params.hops as number) || config.maxHops || 2,
+              (params.hops as number) || 2,
               { kind: params.kind as "relationships" | "properties" | "all" | undefined },
             );
             return json(results);
