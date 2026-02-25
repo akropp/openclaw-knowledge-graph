@@ -629,4 +629,17 @@ program
     }
   });
 
+program
+  .command("unreject-entity <name>")
+  .description("Un-reject an entity and restore its triples")
+  .action((name) => {
+    const db = openDb(program.opts());
+    try {
+      db.unrejectEntity(name);
+      console.log(`Un-rejected entity "${name}" and restored its triples`);
+    } finally {
+      db.close();
+    }
+  });
+
 program.parse();
