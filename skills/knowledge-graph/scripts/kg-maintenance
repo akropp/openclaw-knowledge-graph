@@ -333,6 +333,7 @@ program
         ollamaUrl,
         model,
         apiKey: opts.llmApiKey || config.llm?.apiKey,
+        chunkSize: config.llm?.chunkSize,
       };
 
       if (ingestOpts.useLLM && opts.verbose) {
