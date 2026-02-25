@@ -27,6 +27,7 @@ export interface IngestOptions {
   apiKey?: string;
   chunkSize?: number;
   fresh?: boolean;
+  concurrency?: number;
 }
 
 // Check if a file needs processing
@@ -400,28 +401,35 @@ async function processSessionFilesWithLLMBatched(
     source: string;
   }> = [];
 
-  // Process a batch of messages (flush buffer)
-  async function processBatch(): Promise<void> {
+  // Pending chunks to process concurrently
+  interface PendingChunk {
+    formattedText: string;
+    files: Set<string>;
+    messageCount: number;
+  }
+  const pendingChunks: PendingChunk[] = [];
+
+  // Snapshot current buffer into a pending chunk
+  function snapshotBatch(): void {
     if (messageBuffer.length === 0) return;
-
-    // Format messages with session separators
     const formattedText = formatMessagesWithSeparators(messageBuffer);
+    pendingChunks.push({
+      formattedText,
+      files: new Set(filesInCurrentBatch),
+      messageCount: messageBuffer.length,
+    });
+  }
 
-    if (opts.verbose) {
-      console.log(
-        `    Processing batch: ${messageBuffer.length} messages from ${filesInCurrentBatch.size} files (${formattedText.length} chars)`
-      );
-    }
-
+  // Process a single chunk (called concurrently)
+  async function processChunk(chunk: PendingChunk, idx: number, total: number): Promise<void> {
     // Pre-filter: check if chunk has any entities using fast NLP extraction
-    const quickEntities = extractEntities(formattedText);
+    const quickEntities = extractEntities(chunk.formattedText);
     if (quickEntities.length === 0) {
       if (opts.verbose) {
-        console.log(`      Skipping batch (no entities detected)`);
+        console.log(`  [${idx + 1}/${total}] Skipping batch (no entities detected)`);
       }
-      // Mark files as processed even though we skipped them (no point retrying)
       if (!opts.dryRun) {
-        for (const filePath of filesInCurrentBatch) {
+        for (const filePath of chunk.files) {
           markFileProcessed(graph, filePath);
           stats.filesProcessed++;
         }
@@ -430,19 +438,16 @@ async function processSessionFilesWithLLMBatched(
     }
 
     try {
-      const triples = await extractTriplesWithLLM(formattedText, {
+      const triples = await extractTriplesWithLLM(chunk.formattedText, {
         ollamaUrl: opts.ollamaUrl!,
         model: opts.model!,
         apiKey: opts.apiKey,
         verbose: opts.verbose,
       });
 
-      if (opts.verbose) {
-        console.log(`      Extracted ${triples.length} triples`);
-      }
+      console.log(`  [${idx + 1}/${total}] Extracted ${triples.length} triples from ${chunk.files.size} files`);
 
       for (const triple of triples) {
-        // Add entities
         const subjectKey = triple.subject.toLowerCase();
         if (!allEntities.has(subjectKey)) {
           allEntities.set(subjectKey, {
@@ -461,31 +466,28 @@ async function processSessionFilesWithLLMBatched(
           stats.entitiesAdded++;
         }
 
-        // Add triple with source info
         allTriples.push({
           subject: triple.subject,
           predicate: triple.predicate,
           object: triple.object,
           confidence: 0.9,
-          source: `session:batch:${Array.from(filesInCurrentBatch).map((p) => p.split("/").slice(-1)[0]).join(",")}`,
+          source: `session:batch:${Array.from(chunk.files).map((p) => p.split("/").slice(-1)[0]).join(",")}`,
         });
         stats.triplesAdded++;
       }
 
-      // SUCCESS: Mark all files in this batch as processed
       if (!opts.dryRun) {
-        for (const filePath of filesInCurrentBatch) {
+        for (const filePath of chunk.files) {
           markFileProcessed(graph, filePath);
           stats.filesProcessed++;
         }
       }
     } catch (err: any) {
-      // FAILURE: Don't mark any files as processed
       stats.errors.push(`LLM extraction failed for batch: ${err.message}`);
       if (opts.verbose) {
-        console.error(`      ✗ Batch failed, will retry files next run`);
+        console.error(`  [${idx + 1}/${total}] ✗ Batch failed, will retry files next run`);
       }
-      stats.filesSkipped += filesInCurrentBatch.size;
+      stats.filesSkipped += chunk.files.size;
     }
   }
 
@@ -555,8 +557,8 @@ async function processSessionFilesWithLLMBatched(
 
       // Check if adding this message would exceed chunk size
       if (bufferCharCount + msgLength > chunkSize && messageBuffer.length > 0) {
-        // Flush current batch
-        await processBatch();
+        // Snapshot current batch for later processing
+        snapshotBatch();
 
         // Clear buffer
         messageBuffer.length = 0;
@@ -570,10 +572,30 @@ async function processSessionFilesWithLLMBatched(
     }
   }
 
-  // Flush any remaining messages
+  // Snapshot any remaining messages
   if (messageBuffer.length > 0) {
-    await processBatch();
+    snapshotBatch();
   }
+
+  // Process all chunks with concurrency pool
+  const concurrency = opts.concurrency || 1;
+  const total = pendingChunks.length;
+  console.log(`\n  Processing ${total} chunks with concurrency=${concurrency}...`);
+
+  const activePromises: Map<number, Promise<void>> = new Map();
+  for (let i = 0; i < pendingChunks.length; i++) {
+    const idx = i;
+    const promise = processChunk(pendingChunks[idx], idx, total).finally(() => {
+      activePromises.delete(idx);
+    });
+    activePromises.set(idx, promise);
+
+    if (activePromises.size >= concurrency) {
+      await Promise.race(activePromises.values());
+    }
+  }
+  // Wait for remaining in-flight
+  await Promise.all(activePromises.values());
 
   // Batch-write all entities and triples at the end
   if (!opts.dryRun && (allEntities.size > 0 || allTriples.length > 0)) {

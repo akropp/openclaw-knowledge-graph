@@ -275,6 +275,7 @@ program
   .option("--llm [url]", "Use LLM extraction instead of NLP (URL optional if configured in ~/.openclaw/kg.json)")
   .option("--llm-model <model>", "LLM model to use (overrides config)")
   .option("--llm-api-key <key>", "API key for cloud LLM providers (overrides config)")
+  .option("--concurrency <n>", "Number of concurrent LLM API calls (default 4)", "4")
   .option("--dry-run", "Show what would be ingested without adding to graph")
   .option("--verbose", "Show detailed progress")
   .action(async (opts) => {
@@ -334,6 +335,7 @@ program
         model,
         apiKey: opts.llmApiKey || config.llm?.apiKey,
         chunkSize: config.llm?.chunkSize,
+        concurrency: parseInt(opts.concurrency, 10) || 4,
       };
 
       if (ingestOpts.useLLM && opts.verbose) {
