@@ -49,9 +49,11 @@ export interface HookContext {
 
 function getDbPath(config: KnowledgeGraphConfig): string {
   if (config.dbPath) return resolve(config.dbPath);
-  const dir = resolve(homedir(), ".openclaw");
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  return resolve(dir, "knowledge-graph.db");
+  // Default to shared multi-agent database
+  const sharedPath = resolve(homedir(), "shared", "graph.db");
+  const sharedDir = resolve(homedir(), "shared");
+  if (!existsSync(sharedDir)) mkdirSync(sharedDir, { recursive: true });
+  return sharedPath;
 }
 
 export function activate(ctx: PluginContext): void {

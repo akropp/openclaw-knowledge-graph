@@ -1,0 +1,233 @@
+#!/usr/bin/env node
+
+import { resolve } from "node:path";
+import { existsSync, mkdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { program } from "commander";
+import { GraphDB } from "../../../dist/lib/graph-db.js";
+
+function getDbPath(opts) {
+  if (opts?.db) return resolve(opts.db);
+  if (process.env.KG_DB_PATH) return resolve(process.env.KG_DB_PATH);
+  // Default to shared multi-agent database
+  const sharedPath = resolve(homedir(), "shared", "graph.db");
+  const sharedDir = resolve(homedir(), "shared");
+  if (!existsSync(sharedDir)) mkdirSync(sharedDir, { recursive: true });
+  return sharedPath;
+}
+
+function openDb(opts) {
+  return new GraphDB(getDbPath(opts));
+}
+
+// Simple Levenshtein distance for fuzzy matching
+function levenshtein(a, b) {
+  const matrix = [];
+
+  for (let i = 0; i <= b.length; i++) {
+    matrix[i] = [i];
+  }
+
+  for (let j = 0; j <= a.length; j++) {
+    matrix[0][j] = j;
+  }
+
+  for (let i = 1; i <= b.length; i++) {
+    for (let j = 1; j <= a.length; j++) {
+      if (b.charAt(i - 1) === a.charAt(j - 1)) {
+        matrix[i][j] = matrix[i - 1][j - 1];
+      } else {
+        matrix[i][j] = Math.min(
+          matrix[i - 1][j - 1] + 1,
+          matrix[i][j - 1] + 1,
+          matrix[i - 1][j] + 1
+        );
+      }
+    }
+  }
+
+  return matrix[b.length][a.length];
+}
+
+function findPotentialDuplicates(db, threshold = 0.8) {
+  const entities = db.exportAll().entities;
+  const duplicates = [];
+
+  for (let i = 0; i < entities.length; i++) {
+    for (let j = i + 1; j < entities.length; j++) {
+      const e1 = entities[i];
+      const e2 = entities[j];
+
+      // Only compare entities of the same type
+      if (e1.entity_type !== e2.entity_type) continue;
+
+      const name1 = e1.name.toLowerCase();
+      const name2 = e2.name.toLowerCase();
+
+      // Skip if names are identical (already handled by merge)
+      if (name1 === name2) continue;
+
+      const distance = levenshtein(name1, name2);
+      const maxLen = Math.max(name1.length, name2.length);
+      const similarity = 1 - distance / maxLen;
+
+      if (similarity >= threshold) {
+        duplicates.push({
+          entity1: e1.display_name,
+          entity2: e2.display_name,
+          type: e1.entity_type,
+          similarity: similarity.toFixed(3),
+        });
+      }
+    }
+  }
+
+  return duplicates;
+}
+
+program
+  .name("kg-maintenance")
+  .description("Knowledge graph maintenance tasks for cron jobs")
+  .version("0.1.0")
+  .option("--db <path>", "Database file path");
+
+program
+  .command("prune")
+  .description("Remove orphaned entities (entities with no triples or properties)")
+  .option("--dry-run", "Show what would be pruned without deleting")
+  .option("--quiet", "Only output summary")
+  .action((opts) => {
+    const db = openDb(program.opts());
+    try {
+      const pruned = db.prune({ dryRun: opts.dryRun });
+
+      if (!opts.quiet) {
+        console.log(`=== Orphan Pruning Report ===`);
+        console.log(`Date: ${new Date().toISOString()}`);
+        console.log(`Database: ${getDbPath(program.opts())}`);
+        console.log();
+      }
+
+      if (pruned.length === 0) {
+        if (!opts.quiet) {
+          console.log("✓ No orphaned entities found.");
+        }
+      } else {
+        const verb = opts.dryRun ? "Would prune" : "Pruned";
+        console.log(`${verb} ${pruned.length} orphaned entities:`);
+        if (!opts.quiet) {
+          for (const name of pruned) {
+            console.log(`  - ${name}`);
+          }
+        }
+      }
+    } finally {
+      db.close();
+    }
+  });
+
+program
+  .command("find-duplicates")
+  .description("Find potential duplicate entities via fuzzy name matching")
+  .option("--threshold <n>", "Similarity threshold (0-1)", "0.8")
+  .option("--quiet", "Only output summary")
+  .action((opts) => {
+    const db = openDb(program.opts());
+    try {
+      const duplicates = findPotentialDuplicates(db, parseFloat(opts.threshold));
+
+      if (!opts.quiet) {
+        console.log(`=== Duplicate Detection Report ===`);
+        console.log(`Date: ${new Date().toISOString()}`);
+        console.log(`Database: ${getDbPath(program.opts())}`);
+        console.log(`Threshold: ${opts.threshold}`);
+        console.log();
+      }
+
+      if (duplicates.length === 0) {
+        if (!opts.quiet) {
+          console.log("✓ No potential duplicates found.");
+        }
+      } else {
+        console.log(`Found ${duplicates.length} potential duplicate pairs:`);
+        console.log();
+        for (const dup of duplicates) {
+          console.log(`  "${dup.entity1}" ↔ "${dup.entity2}"`);
+          console.log(`  Type: ${dup.type}, Similarity: ${dup.similarity}`);
+          console.log(`  → To merge: kg merge "${dup.entity1}" "${dup.entity2}"`);
+          console.log();
+        }
+        console.log("⚠️  IMPORTANT: Review each pair manually before merging.");
+        console.log("   Automated merging is NOT recommended due to risk of incorrect merges.");
+      }
+    } finally {
+      db.close();
+    }
+  });
+
+program
+  .command("report")
+  .description("Generate full maintenance report (prune + duplicates)")
+  .option("--threshold <n>", "Similarity threshold for duplicates (0-1)", "0.8")
+  .action((opts) => {
+    const db = openDb(program.opts());
+    try {
+      console.log("╔═══════════════════════════════════════════════════════════════╗");
+      console.log("║       Knowledge Graph Maintenance Report                     ║");
+      console.log("╚═══════════════════════════════════════════════════════════════╝");
+      console.log();
+      console.log(`Date: ${new Date().toISOString()}`);
+      console.log(`Database: ${getDbPath(program.opts())}`);
+      console.log();
+
+      // Stats
+      const stats = db.stats();
+      console.log("--- Graph Statistics ---");
+      console.log(`Entities:   ${stats.entity_count}`);
+      console.log(`Triples:    ${stats.triple_count}`);
+      console.log(`Properties: ${stats.property_count}`);
+      console.log();
+
+      // Orphans
+      console.log("--- Orphaned Entities (dry-run) ---");
+      const orphans = db.prune({ dryRun: true });
+      if (orphans.length === 0) {
+        console.log("✓ No orphaned entities found.");
+      } else {
+        console.log(`⚠️  Found ${orphans.length} orphaned entities:`);
+        for (const name of orphans.slice(0, 10)) {
+          console.log(`  - ${name}`);
+        }
+        if (orphans.length > 10) {
+          console.log(`  ... and ${orphans.length - 10} more`);
+        }
+        console.log();
+        console.log("  To remove: kg-maintenance prune");
+      }
+      console.log();
+
+      // Duplicates
+      console.log("--- Potential Duplicates ---");
+      const duplicates = findPotentialDuplicates(db, parseFloat(opts.threshold));
+      if (duplicates.length === 0) {
+        console.log("✓ No potential duplicates found.");
+      } else {
+        console.log(`⚠️  Found ${duplicates.length} potential duplicate pairs:`);
+        for (const dup of duplicates.slice(0, 10)) {
+          console.log(`  "${dup.entity1}" ↔ "${dup.entity2}" (similarity: ${dup.similarity})`);
+        }
+        if (duplicates.length > 10) {
+          console.log(`  ... and ${duplicates.length - 10} more`);
+        }
+        console.log();
+        console.log("  To merge: kg merge <entity1> <entity2>");
+        console.log("  ⚠️  Review manually before merging!");
+      }
+      console.log();
+      console.log("═══════════════════════════════════════════════════════════════");
+    } finally {
+      db.close();
+    }
+  });
+
+program.parse();

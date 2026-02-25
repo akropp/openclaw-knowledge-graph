@@ -4,15 +4,24 @@ A shared knowledge graph for storing and querying entity relationships across ag
 
 ## When to Use
 
-**Add entities/triples when you learn new facts:**
-- User mentions a person, place, organization, or service
-- You discover relationships between entities (e.g., "Alice works at Acme Corp")
-- Configuration facts: "the API runs on port 8080", "nginx proxies to backend"
+**Add entities/triples when you learn NEW, VERIFIED facts:**
+- User explicitly tells you about a person, place, organization, or service (e.g., "My name is Alice, I work at Acme Corp")
+- You discover relationships between entities through conversation or file inspection
+- Configuration facts from actual files/systems: "the API runs on port 8080", "nginx proxies to backend"
+- **IMPORTANT**: Only add facts you are CERTAIN about. Do not add speculative or inferred information.
+- **IMPORTANT**: Add facts as you learn them, not in bulk afterward. This helps other agents see them sooner.
 
 **Query the graph when:**
 - User asks "who is X?", "what is X?", "how is X related to Y?"
 - You need context about a person, service, or concept mentioned in conversation
 - You want to check if you already know something before asking the user
+- Another agent might have already learned this information (check the graph first!)
+
+**When using fusion queries (if enabled in plugin mode):**
+- The system automatically queries multiple sources (graph + external tools) and merges results
+- Results are ranked by relevance using RRF (Reciprocal Rank Fusion)
+- You'll see context injected as `[Knowledge Graph Context]` before your turn
+- Use this to avoid re-learning facts that are already known
 
 ## CLI Usage
 
@@ -71,8 +80,9 @@ kg import backup.jsonl
 
 ## Configuration
 
-- Default database: `~/.openclaw/knowledge-graph.db`
+- **Default database**: `/home/clawd/shared/graph.db` (shared across all agents)
 - Override with `--db /path/to/db` or `KG_DB_PATH` environment variable
+- The shared database ensures all agents have access to the same knowledge
 
 ## Best Practices
 

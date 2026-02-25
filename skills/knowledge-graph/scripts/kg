@@ -4,14 +4,17 @@ import { resolve } from "node:path";
 import { readFileSync, existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { program } from "commander";
-import { GraphDB } from "../../../lib/graph-db.js";
+import { GraphDB } from "../../../dist/lib/graph-db.js";
+import { fuse } from "../../../dist/lib/rrf.js";
 
 function getDbPath(opts) {
   if (opts?.db) return resolve(opts.db);
   if (process.env.KG_DB_PATH) return resolve(process.env.KG_DB_PATH);
-  const dir = resolve(homedir(), ".openclaw");
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  return resolve(dir, "knowledge-graph.db");
+  // Default to shared multi-agent database
+  const sharedPath = resolve(homedir(), "shared", "graph.db");
+  const sharedDir = resolve(homedir(), "shared");
+  if (!existsSync(sharedDir)) mkdirSync(sharedDir, { recursive: true });
+  return sharedPath;
 }
 
 function openDb(opts) {
@@ -213,15 +216,30 @@ program
     try {
       const data = db.exportAll();
       if (opts.format === "dot") {
+        // Color palette for entity types
+        const typeColors = {
+          person: "#a8d5ff",
+          place: "#b8e6b8",
+          service: "#ffd5a8",
+          organization: "#e6b8e6",
+          concept: "#ffffb8",
+          thing: "#e8e8e8",
+          unknown: "#f0f0f0",
+        };
+
         console.log("digraph knowledge_graph {");
         console.log('  rankdir=LR;');
-        console.log('  node [shape=box, style=filled, fillcolor="#e8e8e8"];');
+        console.log('  node [shape=box, style=filled];');
+
         for (const e of data.entities) {
-          console.log(`  "${e.name}" [label="${e.display_name}\\n[${e.entity_type}]"];`);
+          const color = typeColors[e.entity_type] || typeColors.unknown;
+          console.log(`  "${e.name}" [label="${e.display_name}\\n[${e.entity_type}]", fillcolor="${color}"];`);
         }
+
         for (const t of data.triples) {
           console.log(`  "${t.subject_name}" -> "${t.object_name}" [label="${t.predicate}"];`);
         }
+
         console.log("}");
       } else {
         for (const t of data.triples) {
@@ -270,6 +288,48 @@ program
 
       db.importData({ triples, properties });
       console.log(`Imported ${triples.length} triples, ${properties.length} properties`);
+    } finally {
+      db.close();
+    }
+  });
+
+program
+  .command("fuse <query>")
+  .description("Query multiple sources and fuse results with RRF")
+  .option("--sources <file>", "Path to sources config JSON", resolve(homedir(), ".openclaw", "kg-fusion-sources.json"))
+  .option("--k <n>", "RRF constant (higher = smoother ranking)", "60")
+  .option("--format <fmt>", "Output format: human|jsonl", "human")
+  .action((query, opts) => {
+    const db = openDb(program.opts());
+    try {
+      let sources = [];
+      if (existsSync(opts.sources)) {
+        const sourcesConfig = JSON.parse(readFileSync(opts.sources, "utf-8"));
+        sources = sourcesConfig.sources || sourcesConfig;
+      }
+
+      const results = fuse(query, {
+        graph: db,
+        sources: sources.map(s => ({ ...s, type: "command" })),
+        k: parseInt(opts.k),
+      });
+
+      if (opts.format === "jsonl") {
+        for (const r of results) {
+          console.log(JSON.stringify(r));
+        }
+      } else {
+        if (results.length === 0) {
+          console.log(`No results found for "${query}"`);
+          return;
+        }
+        console.log(`Fusion results for "${query}" (k=${opts.k}):\n`);
+        for (const r of results) {
+          console.log(`[${r.source}] score: ${r.score.toFixed(4)}`);
+          console.log(`  ${r.text.split('\n').join('\n  ')}`);
+          console.log();
+        }
+      }
     } finally {
       db.close();
     }
