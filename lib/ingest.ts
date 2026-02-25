@@ -1104,40 +1104,42 @@ export async function ingestMarkdown(
   }
 
   if (opts.useLLM) {
-    // ── LLM extraction path ──────────────────────────────────────────────
+    // ── LLM extraction path (concurrent) ─────────────────────────────────
     if (!opts.ollamaUrl || !opts.model) {
       throw new Error("LLM extraction requires ollamaUrl and model to be specified");
     }
 
     const chunkSize = opts.chunkSize || 16000;
+    const concurrency = opts.concurrency || 1;
+
+    // Collect work items: files that need processing with their cleaned content
+    interface MdWorkItem {
+      filePath: string;
+      cleanedText: string;
+      entityCount: number;
+    }
+    const workItems: MdWorkItem[] = [];
 
     for (let i = 0; i < mdFiles.length; i++) {
       const filePath = mdFiles[i];
 
-      if (opts.verbose || i % 20 === 0) {
-        console.log(`  [${i + 1}/${mdFiles.length}] ${filePath.split("/").slice(-3).join("/")}`);
-      }
-
       // Resumability: skip already-processed files (unless --fresh)
       if (!opts.fresh && !shouldProcessFile(graph, filePath)) {
         if (opts.verbose) {
-          console.log(`    Skipping (already processed)`);
+          console.log(`  [${i + 1}/${mdFiles.length}] Skipping (already processed) ${filePath.split("/").slice(-3).join("/")}`);
         }
         continue;
       }
 
       try {
         const rawContent = readFileSync(filePath, "utf-8");
-        stats.filesProcessed++;
-
-        // Clean content via preprocessText
         const cleanedText = preprocessText(rawContent);
 
         // NLP pre-filter: skip if no entities detected
         const quickEntities = extractEntities(cleanedText);
         if (quickEntities.length === 0) {
           if (opts.verbose) {
-            console.log(`    Skipping (no entities detected)`);
+            console.log(`  [${i + 1}/${mdFiles.length}] Skipping (no entities) ${filePath.split("/").slice(-3).join("/")}`);
           }
           if (!opts.dryRun) {
             markFileProcessed(graph, filePath);
@@ -1145,69 +1147,74 @@ export async function ingestMarkdown(
           continue;
         }
 
-        // Chunk the file content as a single "document" message
-        const chunks = chunkMessages(
-          [{ role: "document", text: cleanedText }],
-          chunkSize
-        );
+        workItems.push({ filePath, cleanedText, entityCount: quickEntities.length });
+      } catch (err) {
+        stats.errors.push(`Error reading ${filePath}: ${err}`);
+      }
+    }
 
-        if (opts.verbose) {
-          console.log(`    ${quickEntities.length} entities detected, ${chunks.length} chunk(s)`);
-        }
+    console.log(`\n  Processing ${workItems.length} markdown files with concurrency=${concurrency}...`);
 
-        // Extract triples from each chunk via LLM
-        const allTriples: Array<{ subject: string; predicate: string; object: string; subject_type?: string; object_type?: string }> = [];
-        for (let c = 0; c < chunks.length; c++) {
-          if (opts.verbose && chunks.length > 1) {
-            console.log(`      chunk ${c + 1}/${chunks.length} (${chunks[c].length} chars)`);
-          }
-          const triples = await extractTriplesWithLLM(chunks[c], {
+    // Process a single file (called concurrently)
+    async function processMarkdownFile(item: MdWorkItem, idx: number): Promise<void> {
+      const chunks = chunkMessages(
+        [{ role: "document", text: item.cleanedText }],
+        chunkSize
+      );
+
+      try {
+        const fileTriples: Array<{ subject: string; predicate: string; object: string; subject_type?: string; object_type?: string }> = [];
+
+        for (const chunk of chunks) {
+          const triples = await extractTriplesWithLLM(chunk, {
             ollamaUrl: opts.ollamaUrl!,
             model: opts.model!,
             apiKey: opts.apiKey,
-            verbose: opts.verbose,
+            verbose: false,
           });
-          allTriples.push(...triples);
+          fileTriples.push(...triples);
         }
 
-        if (opts.verbose) {
-          console.log(`    Extracted ${allTriples.length} triples`);
-        }
+        console.log(`  [${idx + 1}/${workItems.length}] ${fileTriples.length} triples from ${item.filePath.split("/").slice(-3).join("/")}`);
 
-        // Write entities and triples to graph
+        // Write to graph (single-threaded JS, safe from concurrent callbacks)
         if (!opts.dryRun) {
           graph.batch(() => {
-            for (const triple of allTriples) {
+            for (const triple of fileTriples) {
               graph.addEntity(triple.subject, triple.subject_type || "unknown");
               graph.addEntity(triple.object, triple.object_type || "unknown");
               graph.addTriple(triple.subject, triple.predicate, triple.object, {
                 confidence: 0.9,
-                source: `markdown:${filePath}`,
+                source: `markdown:${item.filePath}`,
               });
             }
           });
+          markFileProcessed(graph, item.filePath);
         }
 
-        stats.entitiesAdded += allTriples.length * 2;
-        stats.triplesAdded += allTriples.length;
-
-        // Mark file as processed
-        if (!opts.dryRun) {
-          markFileProcessed(graph, filePath);
-        }
-
-        if (opts.verbose) {
-          console.log(`  ✓ ${filePath}`);
-        }
-      } catch (err) {
-        const error = `Error processing ${filePath}: ${err}`;
-        stats.errors.push(error);
-        if (opts.verbose) {
-          console.error(`  ✗ ${error}`);
-        }
-        // Don't mark as processed on error — allow retry next run
+        stats.filesProcessed++;
+        stats.entitiesAdded += fileTriples.length * 2;
+        stats.triplesAdded += fileTriples.length;
+      } catch (err: any) {
+        stats.errors.push(`LLM extraction failed for ${item.filePath}: ${err.message}`);
+        console.error(`  [${idx + 1}/${workItems.length}] ✗ ${item.filePath.split("/").slice(-3).join("/")}`);
       }
     }
+
+    // Concurrency pool
+    const activePromises: Map<number, Promise<void>> = new Map();
+    for (let i = 0; i < workItems.length; i++) {
+      const idx = i;
+      const promise = processMarkdownFile(workItems[idx], idx).finally(() => {
+        activePromises.delete(idx);
+      });
+      activePromises.set(idx, promise);
+
+      if (activePromises.size >= concurrency) {
+        await Promise.race(activePromises.values());
+      }
+    }
+    await Promise.all(activePromises.values());
   } else {
     // ── NLP / structured-markdown path (unchanged) ────────────────────────
     // Batch all markdown writes in a single transaction
