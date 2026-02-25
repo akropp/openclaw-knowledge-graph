@@ -86,6 +86,7 @@ export interface AllTripleRow {
   confidence: number;
   source: string;
   rejected: number;
+  reviewed: number;
 }
 
 const SCHEMA = `
@@ -174,6 +175,11 @@ export class GraphDB {
     }
     try {
       this.db.exec(`ALTER TABLE triples ADD COLUMN rejected INTEGER DEFAULT 0`);
+    } catch {
+      // Column already exists — that's fine
+    }
+    try {
+      this.db.exec(`ALTER TABLE triples ADD COLUMN reviewed INTEGER DEFAULT 0`);
     } catch {
       // Column already exists — that's fine
     }
@@ -623,14 +629,23 @@ export class GraphDB {
     ).run(canonical);
   }
 
+  /** Mark triples as reviewed */
+  markReviewed(...ids: number[]): void {
+    const stmt = this.db.prepare(`UPDATE triples SET reviewed = 1, updated_at = datetime('now') WHERE id = ?`);
+    for (const id of ids) stmt.run(id);
+  }
+
   /**
    * Return all triples (optionally including rejected ones) for consolidation.
    */
-  allTriples(opts?: { includeRejected?: boolean }): AllTripleRow[] {
-    const filter = opts?.includeRejected ? "" : "WHERE t.rejected = 0";
+  allTriples(opts?: { includeRejected?: boolean; unreviewedOnly?: boolean }): AllTripleRow[] {
+    const conditions: string[] = [];
+    if (!opts?.includeRejected) conditions.push("t.rejected = 0");
+    if (opts?.unreviewedOnly) conditions.push("t.reviewed = 0");
+    const filter = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
     return this.db.prepare(`
       SELECT t.id, e1.name as subject, t.predicate, e2.name as object,
-             t.confidence, COALESCE(t.source, '') as source, t.rejected
+             t.confidence, COALESCE(t.source, '') as source, t.rejected, COALESCE(t.reviewed, 0) as reviewed
       FROM triples t
       JOIN entities e1 ON t.subject_id = e1.id
       JOIN entities e2 ON t.object_id = e2.id

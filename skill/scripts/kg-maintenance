@@ -839,8 +839,9 @@ Respond with ONLY a JSON array of decisions. If all entities in the cluster are 
                 }
                 if (!opts.dryRun) {
                   db.softMerge(d.canonical, d.alias);
-                  // Record same_as relationship
+                  // Record same_as relationship (bidirectional)
                   db.addTriple(d.alias, "same_as", d.canonical, { confidence: 1.0, source: "consolidation:llm" });
+                  db.addTriple(d.canonical, "same_as", d.alias, { confidence: 1.0, source: "consolidation:llm" });
                 }
                 entitiesMerged++;
               } else if (d.action === "unsure") {
@@ -861,19 +862,20 @@ Respond with ONLY a JSON array of decisions. If all entities in the cluster are 
         // ── Phase 2b: Triple Review (grouped by entity) ───────────────────
         console.log("\n=== Phase 2b: Triple Review ===\n");
 
-        // Re-fetch triples after entity resolution
-        const remaining = db.allTriples({ includeRejected: false });
+        // Only review unreviewed triples, but include reviewed ones as context
+        const unreviewedTriples = db.allTriples({ includeRejected: false, unreviewedOnly: true });
+        const reviewedTriples = db.allTriples({ includeRejected: false });
         const toReview = opts.entity
-          ? remaining.filter(t =>
+          ? unreviewedTriples.filter(t =>
               t.subject.toLowerCase().includes(opts.entity.toLowerCase()) ||
               t.object.toLowerCase().includes(opts.entity.toLowerCase())
             )
-          : remaining;
+          : unreviewedTriples;
 
         if (toReview.length === 0) {
           console.log("No triples to review.");
         } else {
-          // Group triples by entity (each entity gets reviewed with all its relationships)
+          // Group UNREVIEWED triples by entity
           const entityTripleMap = new Map();
           for (const t of toReview) {
             if (!entityTripleMap.has(t.subject)) entityTripleMap.set(t.subject, []);
@@ -882,8 +884,19 @@ Respond with ONLY a JSON array of decisions. If all entities in the cluster are 
             entityTripleMap.get(t.object).push(t);
           }
 
+          // Also build a map of REVIEWED triples per entity (for context only)
+          const contextMap = new Map();
+          for (const t of reviewedTriples) {
+            if (t.reviewed) {
+              if (!contextMap.has(t.subject)) contextMap.set(t.subject, []);
+              contextMap.get(t.subject).push(t);
+              if (!contextMap.has(t.object)) contextMap.set(t.object, []);
+              contextMap.get(t.object).push(t);
+            }
+          }
+
           // Process entities with most triples first, deduplicate reviewed triple IDs
-          const reviewedIds = new Set();
+          const processedIds = new Set();
           const sortedEntities = [...entityTripleMap.entries()]
             .sort((a, b) => b[1].length - a[1].length);
 
@@ -898,35 +911,56 @@ Respond with ONLY a JSON array of decisions. If all entities in the cluster are 
             const batchTriples = [];
             for (const { entity, triples } of currentBatch) {
               for (const t of triples) {
-                if (!reviewedIds.has(t.id)) {
+                if (!processedIds.has(t.id)) {
                   batchTriples.push(t);
                 }
               }
             }
             if (batchTriples.length === 0) return;
 
+            // Gather already-reviewed triples as context for these entities
+            const contextTriples = [];
+            const contextIds = new Set();
+            for (const { entity } of currentBatch) {
+              for (const t of (contextMap.get(entity) || [])) {
+                if (!contextIds.has(t.id)) {
+                  contextTriples.push(t);
+                  contextIds.add(t.id);
+                }
+              }
+            }
+
             const entityNames = currentBatch.map(b => b.entity).join(", ");
+            let contextBlock = "";
+            if (contextTriples.length > 0) {
+              contextBlock = `\nAlready-verified triples for context (DO NOT re-judge these, they are confirmed correct):
+${contextTriples.map(t => `  ✓ ${t.subject} -[${t.predicate}]-> ${t.object}`).join("\n")}
+`;
+            }
+
             const prompt = `You are reviewing knowledge graph triples grouped by entity for accuracy.
 
-For each triple, respond with:
+For each NEW triple (listed below), respond with:
 - "keep" — correct and useful
-- "reject" — incorrect, nonsensical, low-value, duplicate, or contradicts another triple
+- "reject" — incorrect, nonsensical, low-value, duplicate, or contradicts a verified triple
 - "fix" — roughly correct but needs correction (provide the corrected triple)
 
 When you see contradictions (e.g., "dating" and "married_to" for the same pair), keep the correct one and reject the other.
 When you see wrong directionality (parent marked as child), fix it.
+When a new triple duplicates or contradicts an already-verified triple, reject the new one.
 
 Entities being reviewed: ${entityNames}
-
-Triples:
+${contextBlock}
+NEW triples to judge:
 ${JSON.stringify(batchTriples.map(t => ({ id: t.id, subject: t.subject, predicate: t.predicate, object: t.object })), null, 2)}
 
 Respond with ONLY a JSON array: [{id: <id>, action: "keep"|"reject"|"fix", fix?: {subject, predicate, object}, reason?: "brief explanation"}]`;
 
             try {
               const decisions = await llmCall(prompt);
+              const keptIds = [];
               for (const d of decisions) {
-                reviewedIds.add(d.id);
+                processedIds.add(d.id);
                 if (d.action === "reject") {
                   if (!opts.dryRun) db.rejectTriple(d.id);
                   llmRejected++;
@@ -947,7 +981,14 @@ Respond with ONLY a JSON array: [{id: <id>, action: "keep"|"reject"|"fix", fix?:
                     const t = batchTriples.find(b => b.id === d.id);
                     if (t) console.log(`  [FIX]    #${t.id}: ${t.subject} -[${t.predicate}]-> ${t.object} → ${d.fix.subject} -[${d.fix.predicate}]-> ${d.fix.object}`);
                   }
+                } else if (d.action === "keep") {
+                  keptIds.push(d.id);
                 }
+              }
+
+              // Mark kept triples as reviewed
+              if (!opts.dryRun && keptIds.length > 0) {
+                db.markReviewed(...keptIds);
               }
             } catch (err) {
               console.error(`  LLM error reviewing ${entityNames}: ${err}`);
@@ -958,7 +999,7 @@ Respond with ONLY a JSON array: [{id: <id>, action: "keep"|"reject"|"fix", fix?:
           }
 
           for (const [entity, triples] of sortedEntities) {
-            const unreviewedCount = triples.filter(t => !reviewedIds.has(t.id)).length;
+            const unreviewedCount = triples.filter(t => !processedIds.has(t.id)).length;
             if (unreviewedCount === 0) continue;
 
             currentBatch.push({ entity, triples });
