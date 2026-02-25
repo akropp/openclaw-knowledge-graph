@@ -649,6 +649,29 @@ program
       // ── Phase 1: Auto-cleanup ────────────────────────────────────────────
       console.log("=== Phase 1: Auto-cleanup ===\n");
 
+      // Reject garbage entities FIRST (before clustering or triple review)
+      const isSentenceLikeEntity = (s) =>
+        s.startsWith("**") || s.startsWith("- ") || s.startsWith("* ") ||
+        s.includes("`") || s.includes("→") || s.includes("\n") ||
+        /\. [A-Z]/.test(s) ||
+        s.split(/\s+/).length > 6 ||
+        s.length > 60;
+
+      const allEntities = db.exportAll().entities.filter(e => !e.rejected);
+      let autoRejectedEntityCount = 0;
+      for (const entity of allEntities) {
+        if (isSentenceLikeEntity(entity.name)) {
+          if (opts.verbose) {
+            console.log(`  [GARBAGE-ENTITY] "${entity.name.substring(0, 80)}"`);
+          }
+          if (!opts.dryRun) db.rejectEntity(entity.name);
+          autoRejectedEntityCount++;
+        }
+      }
+      if (autoRejectedEntityCount > 0) {
+        console.log(`Rejected ${autoRejectedEntityCount} garbage entities`);
+      }
+
       const allTriples = db.allTriples({ includeRejected: false });
       const filtered = opts.entity
         ? allTriples.filter(t =>
@@ -780,15 +803,26 @@ program
         // ── Phase 2a: Entity Resolution ───────────────────────────────────
         console.log("\n=== Phase 2a: Entity Resolution ===\n");
 
-        const allEntities = db.exportAll().entities.filter(e => !e.rejected);
         const allTriples = db.allTriples({ includeRejected: false });
         let entitiesMerged = 0;
         let entitiesFlagged = 0;
 
-        // Build word index: word → [entity names]
+        // Words too generic to be useful for clustering
+        const STOP_WORDS = new Set([
+          "new", "old", "the", "and", "or", "but", "for", "with", "from",
+          "that", "this", "has", "have", "had", "was", "were", "are", "is",
+          "can", "not", "all", "its", "she", "her", "his", "him", "they",
+          "their", "our", "your", "same", "some", "any", "one", "two", "three",
+          "session", "agent", "note", "update", "event", "item", "task",
+        ]);
+
+        // Re-fetch entities after garbage rejection
+        const cleanEntities = db.exportAll().entities.filter(e => !e.rejected);
+
+        // Build word index: word → [entity names] (4+ char non-stopwords only)
         const wordIndex = new Map();
-        for (const e of allEntities) {
-          const words = e.name.split(/[\s'-]+/).filter(w => w.length > 1);
+        for (const e of cleanEntities) {
+          const words = e.name.split(/[\s'-]+/).filter(w => w.length >= 4 && !STOP_WORDS.has(w.toLowerCase()));
           for (const word of words) {
             if (!wordIndex.has(word)) wordIndex.set(word, []);
             wordIndex.get(word).push(e.name);
@@ -798,15 +832,15 @@ program
         // Find candidate clusters: entities sharing any word, size > 1
         const visited = new Set();
         const clusters = [];
-        for (const e of allEntities) {
+        for (const e of cleanEntities) {
           if (visited.has(e.name)) continue;
-          const words = e.name.split(/[\s'-]+/).filter(w => w.length > 1);
+          const words = e.name.split(/[\s'-]+/).filter(w => w.length >= 4 && !STOP_WORDS.has(w.toLowerCase()));
           const cluster = new Set();
           cluster.add(e.name);
           for (const word of words) {
-            // Skip very common words that would create giant clusters
+            // Skip words that appear in too many entities — too generic
             const candidates = wordIndex.get(word) || [];
-            if (candidates.length > 15) continue;
+            if (candidates.length > 10) continue;
             for (const c of candidates) cluster.add(c);
           }
           if (cluster.size > 1) {
