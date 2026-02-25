@@ -721,6 +721,17 @@ program
       // Auto-merge is too error-prone (e.g., "adam" matches both "adam kropp" and "adam deppe")
       // The LLM can examine triples attached to each entity to determine if they're the same
 
+      // Mark auto-cleanup survivors as reviewed (only if LLM phase is not also running)
+      if (!opts.dryRun && !opts.llm) {
+        const survivors = db.allTriples({ includeRejected: false, unreviewedOnly: true });
+        if (survivors.length > 0) {
+          db.markReviewed(...survivors.map(t => t.id));
+          if (opts.verbose) {
+            console.log(`Marked ${survivors.length} triples as reviewed (auto-cleanup pass)`);
+          }
+        }
+      }
+
       console.log(`Auto-rejected: ${autoRejectedTriples} triples (garbage values)`);
       if (autoRejectedEntities > 0) {
         console.log(`Auto-merged:   ${autoRejectedEntities} entities (duplicates)`);
