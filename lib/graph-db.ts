@@ -7,6 +7,7 @@ export interface Entity {
   entity_type: string;
   created_at: string;
   updated_at: string;
+  rejected?: number;
 }
 
 export interface Triple {
@@ -18,6 +19,7 @@ export interface Triple {
   source: string | null;
   created_at: string;
   updated_at: string;
+  rejected?: number;
 }
 
 export interface Property {
@@ -55,6 +57,8 @@ export interface GraphStats {
   triple_count: number;
   property_count: number;
   top_predicates: Array<{ predicate: string; count: number }>;
+  rejectedEntities?: number;
+  rejectedTriples?: number;
 }
 
 export interface TripleOpts {
@@ -72,6 +76,16 @@ export interface PruneOpts {
 
 export interface QueryOpts {
   kind?: "relationships" | "properties" | "all";
+}
+
+export interface AllTripleRow {
+  id: number;
+  subject: string;
+  predicate: string;
+  object: string;
+  confidence: number;
+  source: string;
+  rejected: number;
 }
 
 const SCHEMA = `
@@ -151,6 +165,18 @@ export class GraphDB {
     this.db.exec(SCHEMA);
     this.db.exec(FTS_SCHEMA);
     this.db.exec(FTS_TRIGGERS);
+
+    // Idempotent migration: add rejected columns if they don't exist yet
+    try {
+      this.db.exec(`ALTER TABLE entities ADD COLUMN rejected INTEGER DEFAULT 0`);
+    } catch {
+      // Column already exists — that's fine
+    }
+    try {
+      this.db.exec(`ALTER TABLE triples ADD COLUMN rejected INTEGER DEFAULT 0`);
+    } catch {
+      // Column already exists — that's fine
+    }
   }
 
   /** Run a callback inside a single transaction (batches all writes). */
@@ -170,11 +196,18 @@ export class GraphDB {
         entity_type = CASE WHEN excluded.entity_type != 'unknown' THEN excluded.entity_type ELSE entities.entity_type END,
         display_name = CASE WHEN excluded.display_name != entities.name THEN excluded.display_name ELSE entities.display_name END,
         updated_at = datetime('now')
+      WHERE rejected = 0
       RETURNING id
     `);
 
-    const row = stmt.get(canonical, displayName, entityType) as { id: number };
-    return row.id;
+    const row = stmt.get(canonical, displayName, entityType) as { id: number } | undefined;
+    if (row) return row.id;
+
+    // Entity exists but is rejected — return existing id without un-rejecting
+    const existing = this.db.prepare(
+      `SELECT id FROM entities WHERE name = ?`
+    ).get(canonical) as { id: number } | undefined;
+    return existing?.id ?? -1;
   }
 
   addTriple(
@@ -195,6 +228,7 @@ export class GraphDB {
         confidence = excluded.confidence,
         source = excluded.source,
         updated_at = datetime('now')
+      WHERE rejected = 0
       RETURNING id
     `);
 
@@ -204,8 +238,14 @@ export class GraphDB {
       objectId,
       confidence,
       source
-    ) as { id: number };
-    return row.id;
+    ) as { id: number } | undefined;
+    if (row) return row.id;
+
+    // Triple exists but is rejected — return existing id without un-rejecting
+    const existing = this.db.prepare(
+      `SELECT id FROM triples WHERE subject_id = ? AND predicate = ? AND object_id = ?`
+    ).get(subjectId, predicate.toLowerCase().trim(), objectId) as { id: number } | undefined;
+    return existing?.id ?? -1;
   }
 
   addProperty(
@@ -244,7 +284,7 @@ export class GraphDB {
     const stmt = this.db.prepare(`
       WITH RECURSIVE hops(entity_id, depth, path, visited, predicate) AS (
         SELECT id, 0, name, ',' || name || ',', NULL
-        FROM entities WHERE name = ?
+        FROM entities WHERE name = ? AND rejected = 0
         UNION ALL
         SELECT
           CASE WHEN t.subject_id = h.entity_id THEN t.object_id ELSE t.subject_id END,
@@ -253,13 +293,14 @@ export class GraphDB {
           h.visited || e2.name || ',',
           t.predicate
         FROM hops h
-        JOIN triples t ON t.subject_id = h.entity_id OR t.object_id = h.entity_id
+        JOIN triples t ON (t.subject_id = h.entity_id OR t.object_id = h.entity_id) AND t.rejected = 0
         JOIN entities e2 ON e2.id = CASE WHEN t.subject_id = h.entity_id THEN t.object_id ELSE t.subject_id END
+          AND e2.rejected = 0
         WHERE h.depth < ? AND h.visited NOT LIKE '%,' || e2.name || ',%'
       )
       SELECT h.entity_id, h.depth, h.path, e.name, e.entity_type
       FROM hops h
-      JOIN entities e ON e.id = h.entity_id
+      JOIN entities e ON e.id = h.entity_id AND e.rejected = 0
       WHERE h.depth = 0 OR h.predicate IS NOT NULL
       ORDER BY h.depth
     `);
@@ -271,7 +312,7 @@ export class GraphDB {
       return allResults;
     }
 
-    return allResults.filter((result, idx) => {
+    return allResults.filter((result) => {
       // Always keep the root entity (depth 0)
       if (result.depth === 0) return true;
 
@@ -300,7 +341,7 @@ export class GraphDB {
       SELECT e.*
       FROM entities_fts fts
       JOIN entities e ON e.name = fts.name
-      WHERE entities_fts MATCH ?
+      WHERE entities_fts MATCH ? AND e.rejected = 0
       ORDER BY rank
       LIMIT 20
     `);
@@ -317,7 +358,7 @@ export class GraphDB {
     } catch {
       // Fallback to LIKE if FTS query fails
       const likeStmt = this.db.prepare(`
-        SELECT * FROM entities WHERE name LIKE ? OR display_name LIKE ? LIMIT 20
+        SELECT * FROM entities WHERE (name LIKE ? OR display_name LIKE ?) AND rejected = 0 LIMIT 20
       `);
       const pattern = `%${text.toLowerCase().trim()}%`;
       return likeStmt.all(pattern, pattern) as Entity[];
@@ -327,7 +368,9 @@ export class GraphDB {
   getEntity(name: string): EntityDetail | null {
     const canonical = name.toLowerCase().trim();
 
-    const entity = this.db.prepare("SELECT * FROM entities WHERE name = ?").get(canonical) as Entity | undefined;
+    const entity = this.db.prepare(
+      "SELECT * FROM entities WHERE name = ? AND rejected = 0"
+    ).get(canonical) as Entity | undefined;
     if (!entity) return null;
 
     const triples = this.db
@@ -342,7 +385,7 @@ export class GraphDB {
       FROM triples t
       JOIN entities es ON es.id = t.subject_id
       JOIN entities eo ON eo.id = t.object_id
-      WHERE t.subject_id = ? OR t.object_id = ?
+      WHERE (t.subject_id = ? OR t.object_id = ?) AND t.rejected = 0
     `
       )
       .all(entity.id, entity.id, entity.id, entity.id, entity.id) as EntityDetail["triples"];
@@ -411,6 +454,7 @@ export class GraphDB {
       SELECT e.name FROM entities e
       WHERE NOT EXISTS (SELECT 1 FROM triples t WHERE t.subject_id = e.id OR t.object_id = e.id)
         AND NOT EXISTS (SELECT 1 FROM properties p WHERE p.entity_id = e.id)
+        AND e.rejected = 0
     `
       )
       .all() as Array<{ name: string }>;
@@ -432,12 +476,12 @@ export class GraphDB {
 
   stats(): GraphStats {
     const entityCount = (
-      this.db.prepare("SELECT COUNT(*) as count FROM entities").get() as {
+      this.db.prepare("SELECT COUNT(*) as count FROM entities WHERE rejected = 0").get() as {
         count: number;
       }
     ).count;
     const tripleCount = (
-      this.db.prepare("SELECT COUNT(*) as count FROM triples").get() as {
+      this.db.prepare("SELECT COUNT(*) as count FROM triples WHERE rejected = 0").get() as {
         count: number;
       }
     ).count;
@@ -451,6 +495,7 @@ export class GraphDB {
         `
       SELECT predicate, COUNT(*) as count
       FROM triples
+      WHERE rejected = 0
       GROUP BY predicate
       ORDER BY count DESC
       LIMIT 10
@@ -458,12 +503,94 @@ export class GraphDB {
       )
       .all() as Array<{ predicate: string; count: number }>;
 
+    const rejectedEntities = (
+      this.db.prepare("SELECT COUNT(*) as count FROM entities WHERE rejected = 1").get() as {
+        count: number;
+      }
+    ).count;
+    const rejectedTriples = (
+      this.db.prepare("SELECT COUNT(*) as count FROM triples WHERE rejected = 1").get() as {
+        count: number;
+      }
+    ).count;
+
     return {
       entity_count: entityCount,
       triple_count: tripleCount,
       property_count: propertyCount,
       top_predicates: topPredicates,
+      rejectedEntities,
+      rejectedTriples,
     };
+  }
+
+  // ─── Reject / Unreject methods ───────────────────────────────────────────
+
+  rejectTriple(id: number): void {
+    this.db.prepare(
+      `UPDATE triples SET rejected = 1, updated_at = datetime('now') WHERE id = ?`
+    ).run(id);
+  }
+
+  rejectEntity(name: string): void {
+    const canonical = name.toLowerCase().trim();
+    this.db.prepare(
+      `UPDATE entities SET rejected = 1, updated_at = datetime('now') WHERE name = ?`
+    ).run(canonical);
+    // Also reject all triples involving this entity
+    const entity = this.db.prepare(
+      `SELECT id FROM entities WHERE name = ?`
+    ).get(canonical) as { id: number } | undefined;
+    if (entity) {
+      this.db.prepare(
+        `UPDATE triples SET rejected = 1, updated_at = datetime('now') WHERE subject_id = ? OR object_id = ?`
+      ).run(entity.id, entity.id);
+    }
+  }
+
+  unrejectTriple(id: number): void {
+    this.db.prepare(
+      `UPDATE triples SET rejected = 0, updated_at = datetime('now') WHERE id = ?`
+    ).run(id);
+  }
+
+  unrejectEntity(name: string): void {
+    const canonical = name.toLowerCase().trim();
+    this.db.prepare(
+      `UPDATE entities SET rejected = 0, updated_at = datetime('now') WHERE name = ?`
+    ).run(canonical);
+  }
+
+  /**
+   * Return all triples (optionally including rejected ones) for consolidation.
+   */
+  allTriples(opts?: { includeRejected?: boolean }): AllTripleRow[] {
+    const filter = opts?.includeRejected ? "" : "WHERE t.rejected = 0";
+    return this.db.prepare(`
+      SELECT t.id, e1.name as subject, t.predicate, e2.name as object,
+             t.confidence, COALESCE(t.source, '') as source, t.rejected
+      FROM triples t
+      JOIN entities e1 ON t.subject_id = e1.id
+      JOIN entities e2 ON t.object_id = e2.id
+      ${filter}
+      ORDER BY e1.name, t.predicate, e2.name
+    `).all() as AllTripleRow[];
+  }
+
+  /**
+   * Find a triple id by subject/predicate/object names.
+   */
+  findTripleId(subject: string, predicate: string, object: string): number | null {
+    const s = subject.toLowerCase().trim();
+    const p = predicate.toLowerCase().trim();
+    const o = object.toLowerCase().trim();
+    const row = this.db.prepare(`
+      SELECT t.id FROM triples t
+      JOIN entities e1 ON t.subject_id = e1.id AND e1.name = ?
+      JOIN entities e2 ON t.object_id = e2.id AND e2.name = ?
+      WHERE t.predicate = ?
+    `).get(s, o, p) as { id: number } | undefined;
+    return row?.id ?? null;
   }
 
   exportAll(): {

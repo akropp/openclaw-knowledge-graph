@@ -337,9 +337,15 @@ program
     const db = openDb(program.opts());
     try {
       const s = db.stats();
-      console.log(`Entities:   ${s.entity_count}`);
-      console.log(`Triples:    ${s.triple_count}`);
-      console.log(`Properties: ${s.property_count}`);
+      console.log(`Entities:          ${s.entity_count}`);
+      console.log(`Triples:           ${s.triple_count}`);
+      console.log(`Properties:        ${s.property_count}`);
+      if (s.rejectedEntities !== undefined) {
+        console.log(`Rejected entities: ${s.rejectedEntities}`);
+      }
+      if (s.rejectedTriples !== undefined) {
+        console.log(`Rejected triples:  ${s.rejectedTriples}`);
+      }
       if (s.top_predicates.length > 0) {
         console.log("Top predicates:");
         for (const p of s.top_predicates) {
@@ -567,6 +573,57 @@ program
     } catch (err) {
       console.error(`Ingest failed: ${err}`);
       process.exitCode = 1;
+    } finally {
+      db.close();
+    }
+  });
+
+program
+  .command("reject <subject> <predicate> <object>")
+  .description("Reject a specific triple (exclude from queries)")
+  .action((subject, predicate, object) => {
+    const db = openDb(program.opts());
+    try {
+      const id = db.findTripleId(subject, predicate, object);
+      if (id === null) {
+        console.error(`Triple not found: ${subject} -[${predicate}]-> ${object}`);
+        process.exitCode = 1;
+        return;
+      }
+      db.rejectTriple(id);
+      console.log(`Rejected triple #${id}: ${subject} -[${predicate}]-> ${object}`);
+    } finally {
+      db.close();
+    }
+  });
+
+program
+  .command("unreject <subject> <predicate> <object>")
+  .description("Un-reject a specific triple (restore to active)")
+  .action((subject, predicate, object) => {
+    const db = openDb(program.opts());
+    try {
+      const id = db.findTripleId(subject, predicate, object);
+      if (id === null) {
+        console.error(`Triple not found: ${subject} -[${predicate}]-> ${object}`);
+        process.exitCode = 1;
+        return;
+      }
+      db.unrejectTriple(id);
+      console.log(`Un-rejected triple #${id}: ${subject} -[${predicate}]-> ${object}`);
+    } finally {
+      db.close();
+    }
+  });
+
+program
+  .command("reject-entity <name>")
+  .description("Reject an entity and all its triples")
+  .action((name) => {
+    const db = openDb(program.opts());
+    try {
+      db.rejectEntity(name);
+      console.log(`Rejected entity "${name}" and all its triples`);
     } finally {
       db.close();
     }

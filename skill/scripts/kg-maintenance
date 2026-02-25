@@ -617,4 +617,340 @@ program
     }
   });
 
+program
+  .command("consolidate")
+  .description("Clean up garbage triples and optionally review with LLM or interactively")
+  .option("--auto", "Auto-cleanup only (garbage values, duplicates) — default behavior")
+  .option("--llm", "Use LLM for review after auto-cleanup")
+  .option("--interactive", "Interactive review of triples")
+  .option("--dry-run", "Show what would be changed without changing")
+  .option("--verbose", "Show details")
+  .option("--entity <name>", "Only consolidate triples involving this entity")
+  .action(async (opts) => {
+    const db = openDb(program.opts());
+
+    const GARBAGE_OBJECTS = [
+      "unknown", "none", "n/a", "null", "undefined", "not specified",
+      "not mentioned", "email address", "phone number", "email_address",
+      "unspecified", "various", "multiple", "tbd", "to be determined",
+      "unclear", "unknown entity", "unknown person", "unknown organization",
+    ];
+
+    let autoRejectedTriples = 0;
+    let autoRejectedEntities = 0;
+    let llmRejected = 0;
+    let llmFixed = 0;
+    let interactiveRejected = 0;
+    let kept = 0;
+
+    try {
+      // ── Phase 1: Auto-cleanup ────────────────────────────────────────────
+      console.log("=== Phase 1: Auto-cleanup ===\n");
+
+      const allTriples = db.allTriples({ includeRejected: false });
+      const filtered = opts.entity
+        ? allTriples.filter(t =>
+            t.subject.toLowerCase().includes(opts.entity.toLowerCase()) ||
+            t.object.toLowerCase().includes(opts.entity.toLowerCase())
+          )
+        : allTriples;
+
+      for (const triple of filtered) {
+        const objLower = triple.object.toLowerCase().trim();
+        const subjLower = triple.subject.toLowerCase().trim();
+
+        // Garbage object values
+        if (GARBAGE_OBJECTS.includes(objLower)) {
+          if (opts.verbose) {
+            console.log(`  [GARBAGE-OBJ] #${triple.id}: ${triple.subject} -[${triple.predicate}]-> ${triple.object}`);
+          }
+          if (!opts.dryRun) db.rejectTriple(triple.id);
+          autoRejectedTriples++;
+          continue;
+        }
+
+        // Self-referential triples
+        if (subjLower === objLower) {
+          if (opts.verbose) {
+            console.log(`  [SELF-REF]    #${triple.id}: ${triple.subject} -[${triple.predicate}]-> ${triple.object}`);
+          }
+          if (!opts.dryRun) db.rejectTriple(triple.id);
+          autoRejectedTriples++;
+          continue;
+        }
+
+        // Garbage subject values
+        if (GARBAGE_OBJECTS.includes(subjLower)) {
+          if (opts.verbose) {
+            console.log(`  [GARBAGE-SUB] #${triple.id}: ${triple.subject} -[${triple.predicate}]-> ${triple.object}`);
+          }
+          if (!opts.dryRun) db.rejectTriple(triple.id);
+          autoRejectedTriples++;
+          continue;
+        }
+
+        // Very long garbage entities (likely extracted code/file paths)
+        if (triple.object.length > 200 || triple.subject.length > 200) {
+          if (opts.verbose) {
+            console.log(`  [TOO-LONG]    #${triple.id}: ${triple.subject.substring(0, 60)}...`);
+          }
+          if (!opts.dryRun) db.rejectTriple(triple.id);
+          autoRejectedTriples++;
+          continue;
+        }
+
+        // Object looks like a file path or URL fragment
+        if (
+          triple.object.includes("://") ||
+          triple.object.includes("\\") ||
+          triple.object.match(/^\/.+\.(ts|js|json|py|sh|md)$/)
+        ) {
+          if (opts.verbose) {
+            console.log(`  [FILE-PATH]   #${triple.id}: ${triple.subject} -[${triple.predicate}]-> ${triple.object}`);
+          }
+          if (!opts.dryRun) db.rejectTriple(triple.id);
+          autoRejectedTriples++;
+          continue;
+        }
+      }
+
+      // Auto-detect duplicate entities (name containment)
+      if (!opts.entity) {
+        const allEntities = db.exportAll().entities.filter(e => !e.rejected);
+        const processed = new Set();
+
+        for (let i = 0; i < allEntities.length; i++) {
+          const e1 = allEntities[i];
+          const n1 = e1.name;
+          if (processed.has(n1)) continue;
+
+          for (let j = i + 1; j < allEntities.length; j++) {
+            const e2 = allEntities[j];
+            const n2 = e2.name;
+            if (processed.has(n2)) continue;
+
+            // Check if one name contains the other (e.g., "adam" vs "adam kropp")
+            if ((n1.includes(n2) || n2.includes(n1)) && n1 !== n2) {
+              // Prefer longer (fuller) name — merge shorter into longer
+              const longer = n1.length >= n2.length ? n1 : n2;
+              const shorter = n1.length >= n2.length ? n2 : n1;
+
+              // Only auto-merge if the shorter is a strict prefix/suffix and short enough
+              const lenRatio = shorter.length / longer.length;
+              if (lenRatio >= 0.5 && shorter.length >= 3) {
+                if (opts.verbose) {
+                  console.log(`  [DUPLICATE]   Merging "${shorter}" into "${longer}"`);
+                }
+                if (!opts.dryRun) {
+                  try {
+                    db.merge(longer, shorter);
+                    autoRejectedEntities++;
+                    processed.add(shorter);
+                  } catch {
+                    // Merge failed — skip
+                  }
+                } else {
+                  autoRejectedEntities++;
+                }
+              }
+            }
+          }
+        }
+      }
+
+      console.log(`Auto-rejected: ${autoRejectedTriples} triples (garbage values)`);
+      if (autoRejectedEntities > 0) {
+        console.log(`Auto-merged:   ${autoRejectedEntities} entities (duplicates)`);
+      }
+
+      // ── Phase 2: LLM Review ──────────────────────────────────────────────
+      if (opts.llm) {
+        console.log("\n=== Phase 2: LLM Review ===\n");
+        const config = loadConfig();
+        const llmUrl = config.llm?.baseUrl || "http://mac-mini.tailcd0984.ts.net:11434";
+        const llmModel = config.llm?.model || "qwen2.5:14b";
+        const apiKey = config.llm?.apiKey;
+
+        const remaining = db.allTriples({ includeRejected: false });
+        const toReview = opts.entity
+          ? remaining.filter(t =>
+              t.subject.toLowerCase().includes(opts.entity.toLowerCase()) ||
+              t.object.toLowerCase().includes(opts.entity.toLowerCase())
+            )
+          : remaining;
+
+        if (toReview.length === 0) {
+          console.log("No triples to review.");
+        } else {
+          // Batch into chunks of 50
+          const BATCH = 50;
+          for (let i = 0; i < toReview.length; i += BATCH) {
+            const batch = toReview.slice(i, i + BATCH);
+            const prompt = `You are reviewing knowledge graph triples for accuracy and quality. For each triple below, respond with exactly one of:
+- "keep" — if the triple is correct and useful
+- "reject" — if it is incorrect, nonsensical, low-value, or garbage
+- "fix: <new-subject> | <new-predicate> | <new-object>" — if it's roughly correct but has errors
+
+Respond with a JSON array of objects: [{id: <id>, action: "keep"|"reject"|"fix", fix?: {subject, predicate, object}}]
+
+Triples to review:
+${JSON.stringify(batch.map(t => ({ id: t.id, subject: t.subject, predicate: t.predicate, object: t.object })), null, 2)}
+
+Respond with ONLY the JSON array, no other text.`;
+
+            try {
+              let responseText;
+
+              if (apiKey) {
+                // Cloud LLM (OpenAI-compatible)
+                const baseUrl = llmUrl.replace(/\/+$/, "");
+                const resp = await fetch(`${baseUrl}/chat/completions`, {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/json",
+                    "Authorization": `Bearer ${apiKey}`,
+                  },
+                  body: JSON.stringify({
+                    model: llmModel,
+                    messages: [{ role: "user", content: prompt }],
+                    temperature: 0,
+                  }),
+                });
+                const data = await resp.json();
+                responseText = data.choices?.[0]?.message?.content || "[]";
+              } else {
+                // Ollama
+                const resp = await fetch(`${llmUrl}/api/chat`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    model: llmModel,
+                    messages: [{ role: "user", content: prompt }],
+                    stream: false,
+                    options: { temperature: 0 },
+                  }),
+                });
+                const data = await resp.json();
+                responseText = data.message?.content || "[]";
+              }
+
+              // Parse response
+              const jsonMatch = responseText.match(/\[[\s\S]*\]/);
+              if (!jsonMatch) continue;
+
+              const decisions = JSON.parse(jsonMatch[0]);
+
+              for (const d of decisions) {
+                if (d.action === "reject") {
+                  if (!opts.dryRun) db.rejectTriple(d.id);
+                  llmRejected++;
+                  if (opts.verbose) {
+                    const t = batch.find(b => b.id === d.id);
+                    if (t) console.log(`  [LLM-REJECT] #${t.id}: ${t.subject} -[${t.predicate}]-> ${t.object}`);
+                  }
+                } else if (d.action === "fix" && d.fix) {
+                  if (!opts.dryRun) {
+                    db.rejectTriple(d.id);
+                    db.addTriple(d.fix.subject, d.fix.predicate, d.fix.object);
+                  }
+                  llmFixed++;
+                  if (opts.verbose) {
+                    const t = batch.find(b => b.id === d.id);
+                    if (t) console.log(`  [LLM-FIX]    #${t.id}: ${t.subject} -[${t.predicate}]-> ${t.object} => ${d.fix.subject} -[${d.fix.predicate}]-> ${d.fix.object}`);
+                  }
+                }
+              }
+            } catch (err) {
+              console.error(`  LLM error on batch starting at ${i}: ${err}`);
+            }
+          }
+          console.log(`LLM-rejected: ${llmRejected} triples`);
+          console.log(`LLM-fixed:    ${llmFixed} triples`);
+        }
+      }
+
+      // ── Phase 3: Interactive Review ───────────────────────────────────────
+      if (opts.interactive) {
+        console.log("\n=== Phase 3: Interactive Review ===\n");
+        console.log("For each triple, press: [K]eep / [R]eject / [F]ix / [S]kip\n");
+
+        const { createInterface } = await import("node:readline/promises");
+        const rl = createInterface({ input: process.stdin, output: process.stdout });
+
+        const remaining = db.allTriples({ includeRejected: false });
+        const toReview = opts.entity
+          ? remaining.filter(t =>
+              t.subject.toLowerCase().includes(opts.entity.toLowerCase()) ||
+              t.object.toLowerCase().includes(opts.entity.toLowerCase())
+            )
+          : remaining;
+
+        let idx = 0;
+        for (const triple of toReview) {
+          idx++;
+          process.stdout.write(`[${idx}/${toReview.length}] ${triple.subject} -[${triple.predicate}]-> ${triple.object}`);
+          if (triple.source) process.stdout.write(` (src: ${triple.source})`);
+          process.stdout.write("\n");
+
+          const answer = await rl.question("  [K]eep / [R]eject / [F]ix / [S]kip > ");
+          const choice = answer.trim().toLowerCase();
+
+          if (choice === "r") {
+            if (!opts.dryRun) db.rejectTriple(triple.id);
+            interactiveRejected++;
+            console.log("  → Rejected\n");
+          } else if (choice === "f") {
+            const newSubject = await rl.question(`  New subject [${triple.subject}]: `);
+            const newPredicate = await rl.question(`  New predicate [${triple.predicate}]: `);
+            const newObject = await rl.question(`  New object [${triple.object}]: `);
+            if (!opts.dryRun) {
+              db.rejectTriple(triple.id);
+              db.addTriple(
+                newSubject.trim() || triple.subject,
+                newPredicate.trim() || triple.predicate,
+                newObject.trim() || triple.object
+              );
+            }
+            llmFixed++;
+            console.log("  → Fixed\n");
+          } else if (choice === "k") {
+            kept++;
+            console.log("  → Kept\n");
+          } else {
+            // Skip (or enter)
+            console.log("  → Skipped\n");
+          }
+        }
+
+        rl.close();
+      }
+
+      // Count remaining kept triples
+      if (!opts.interactive) {
+        kept = db.allTriples({ includeRejected: false }).length;
+      }
+
+      // ── Summary ───────────────────────────────────────────────────────────
+      console.log("\n=== Consolidation Results ===");
+      console.log(`Auto-rejected:          ${autoRejectedTriples} triples (garbage values)`);
+      if (autoRejectedEntities > 0) {
+        console.log(`Auto-merged:            ${autoRejectedEntities} entities (duplicates)`);
+      }
+      if (opts.llm) {
+        console.log(`LLM-rejected:           ${llmRejected} triples`);
+        console.log(`LLM-fixed:              ${llmFixed} triples`);
+      }
+      if (opts.interactive) {
+        console.log(`Interactively rejected: ${interactiveRejected} triples`);
+      }
+      console.log(`Kept:                   ${kept} triples`);
+
+      if (opts.dryRun) {
+        console.log("\n(Dry run — no changes made)");
+      }
+    } finally {
+      db.close();
+    }
+  });
+
 program.parse();
