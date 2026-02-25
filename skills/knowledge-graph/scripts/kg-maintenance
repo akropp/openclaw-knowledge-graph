@@ -256,6 +256,8 @@ program
     "Path to facts.db (default: ~/shared/facts.db)",
     resolve(homedir(), "shared", "facts.db")
   )
+  .option("--llm [url]", "Use LLM extraction instead of NLP (default URL: http://mac-mini.tailcd0984.ts.net:11434)")
+  .option("--llm-model <model>", "LLM model to use (default: qwen2.5:14b)", "qwen2.5:14b")
   .option("--dry-run", "Show what would be ingested without adding to graph")
   .option("--verbose", "Show detailed progress")
   .action(async (opts) => {
@@ -276,7 +278,17 @@ program
       console.log();
 
       let stats;
-      const ingestOpts = { dryRun: opts.dryRun, verbose: opts.verbose };
+      const ingestOpts = {
+        dryRun: opts.dryRun,
+        verbose: opts.verbose,
+        useLLM: opts.llm !== undefined,
+        ollamaUrl: typeof opts.llm === "string" ? opts.llm : "http://mac-mini.tailcd0984.ts.net:11434",
+        model: opts.llmModel,
+      };
+
+      if (ingestOpts.useLLM && opts.verbose) {
+        console.log(`LLM extraction enabled: ${ingestOpts.ollamaUrl} (model: ${ingestOpts.model})`);
+      }
 
       switch (opts.source.toLowerCase()) {
         case "sessions":
@@ -340,16 +352,92 @@ program
   .command("test-file <file>")
   .description("Process a single file and show exactly what would be extracted (no DB writes)")
   .option("--limit <n>", "Max entities to show", "50")
+  .option("--llm [url]", "Use LLM extraction instead of NLP (default URL: http://mac-mini.tailcd0984.ts.net:11434)")
+  .option("--llm-model <model>", "LLM model to use (default: qwen2.5:14b)", "qwen2.5:14b")
   .action(async (file, opts) => {
-    const { extractEntities } = await import("../../../dist/lib/entity-extract.js");
     const { readFileSync, createReadStream } = await import("node:fs");
     const { createInterface } = await import("node:readline");
     const limit = parseInt(opts.limit, 10);
+    
+    const useLLM = opts.llm !== undefined;
+    const ollamaUrl = typeof opts.llm === "string" ? opts.llm : "http://mac-mini.tailcd0984.ts.net:11434";
+    const model = opts.llmModel;
 
     const isSession = file.includes(".jsonl");
 
-    if (isSession) {
-      // Process as session JSONL
+    if (isSession && useLLM) {
+      // LLM-based extraction for sessions
+      const { extractTriplesWithLLM, chunkMessages } = await import("../../../dist/lib/llm-extract.js");
+      
+      console.log(`\n🤖 Using LLM extraction (${model})`);
+      console.log(`File: ${file}\n`);
+
+      // Read messages
+      const messages = [];
+      const rl = createInterface({ input: createReadStream(file, "utf-8"), crlfDelay: Infinity });
+
+      for await (const line of rl) {
+        try {
+          const obj = JSON.parse(line);
+          if (obj.type !== "message" || !obj.message) continue;
+          const role = obj.message.role;
+          if (role !== "user" && role !== "assistant") continue;
+
+          let text = obj.message.content;
+          if (Array.isArray(text)) {
+            text = text.filter(b => b.type === "text").map(b => b.text).join("\n");
+          }
+          if (!text || text.length < 10) continue;
+
+          messages.push({ role, text });
+        } catch { /* skip bad lines */ }
+      }
+
+      console.log(`Messages: ${messages.length}`);
+
+      // Chunk and process
+      const chunks = chunkMessages(messages, 2000);
+      console.log(`Chunks: ${chunks.length}\n`);
+
+      const allTriples = [];
+      const entityMap = new Map(); // name -> type
+
+      for (let i = 0; i < chunks.length; i++) {
+        console.log(`Processing chunk ${i + 1}/${chunks.length}...`);
+        const triples = await extractTriplesWithLLM(chunks[i], {
+          ollamaUrl: ollamaUrl,
+          model: model,
+          verbose: true,
+        });
+        
+        console.log(`  ✓ Extracted ${triples.length} triples`);
+        
+        for (const t of triples) {
+          allTriples.push(t);
+          entityMap.set(t.subject.toLowerCase(), { name: t.subject, type: t.subject_type || "unknown" });
+          entityMap.set(t.object.toLowerCase(), { name: t.object, type: t.object_type || "unknown" });
+        }
+      }
+
+      console.log(`\n=== Results ===`);
+      console.log(`Unique entities: ${entityMap.size}`);
+      console.log(`Triples: ${allTriples.length}`);
+
+      console.log(`\n=== Entities ===`);
+      const entities = [...entityMap.values()];
+      for (const e of entities.slice(0, limit)) {
+        console.log(`  - ${e.name} (${e.type})`);
+      }
+
+      console.log(`\n=== Sample Triples ===`);
+      for (const t of allTriples.slice(0, limit)) {
+        console.log(`  ${t.subject} --[${t.predicate}]--> ${t.object}`);
+      }
+
+    } else if (isSession) {
+      // NLP-based extraction for sessions
+      const { extractEntities } = await import("../../../dist/lib/entity-extract.js");
+      
       const rl = createInterface({ input: createReadStream(file, "utf-8"), crlfDelay: Infinity });
       let msgCount = 0;
       const allEntities = new Map(); // name -> {type, count, sampleContext}
@@ -414,7 +502,8 @@ program
       }
 
     } else {
-      // Process as markdown
+      // Process as markdown (always NLP-based)
+      const { extractEntities } = await import("../../../dist/lib/entity-extract.js");
       const content = readFileSync(file, "utf-8");
       const entities = extractEntities(content);
 

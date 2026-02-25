@@ -51,7 +51,7 @@ function isStopWord(word: string): boolean {
  * Preprocess text to remove markdown, code blocks, JSON, and technical artifacts
  * before feeding to NLP extraction
  */
-function preprocessText(text: string): string {
+export function preprocessText(text: string): string {
   let cleaned = text;
 
   // Strip markdown code blocks (``` ... ```)

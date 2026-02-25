@@ -4,6 +4,7 @@ import { createInterface } from "node:readline";
 import Database from "better-sqlite3";
 import type { GraphDB } from "./graph-db.js";
 import { extractEntities } from "./entity-extract.js";
+import { extractTriplesWithLLM, chunkMessages, type LLMExtractOptions } from "./llm-extract.js";
 
 export interface IngestStats {
   filesProcessed: number;
@@ -19,6 +20,9 @@ export interface IngestStats {
 export interface IngestOptions {
   dryRun?: boolean;
   verbose?: boolean;
+  useLLM?: boolean;
+  ollamaUrl?: string;
+  model?: string;
 }
 
 // Normalize factmem keys to predicates
@@ -264,8 +268,143 @@ function createCooccurrenceTriples(
   return triples;
 }
 
+// Process a single session file using LLM for triple extraction
+async function processSessionFileWithLLM(
+  graph: GraphDB,
+  filePath: string,
+  opts: IngestOptions
+): Promise<{ messagesProcessed: number; entitiesAdded: number; triplesAdded: number; propertiesAdded: number; errors: string[] }> {
+  const stats = {
+    messagesProcessed: 0,
+    entitiesAdded: 0,
+    triplesAdded: 0,
+    propertiesAdded: 0,
+    errors: [] as string[]
+  };
+
+  // Collect messages
+  const messages: Array<{ role: string; text: string }> = [];
+
+  await new Promise<void>((resolve) => {
+    const fileStream = createReadStream(filePath, { encoding: "utf-8" });
+    const rl = createInterface({ input: fileStream, crlfDelay: Infinity });
+
+    rl.on("line", (line) => {
+      try {
+        const obj = JSON.parse(line);
+
+        // Only user/assistant messages, no tool output
+        if (
+          obj.type === "message" &&
+          obj.message &&
+          (obj.message.role === "user" || obj.message.role === "assistant")
+        ) {
+          const text = extractTextFromContent(obj.message.content);
+          if (text && text.length > 10) {
+            messages.push({ role: obj.message.role, text });
+            stats.messagesProcessed++;
+          }
+        }
+      } catch (err) {
+        // Skip invalid JSON lines
+      }
+    });
+
+    rl.on("close", () => resolve());
+    rl.on("error", (err) => {
+      stats.errors.push(`Error reading ${filePath}: ${err}`);
+      resolve();
+    });
+  });
+
+  if (messages.length === 0) {
+    return stats;
+  }
+
+  // Chunk messages for LLM processing
+  const chunks = chunkMessages(messages, 2000);
+
+  if (opts.verbose) {
+    console.log(`    Processing ${messages.length} messages in ${chunks.length} chunks with LLM...`);
+  }
+
+  // Collect all entities and triples
+  const allEntities = new Map<string, { name: string; type: string }>();
+  const allTriples: Array<{ subject: string; predicate: string; object: string; confidence: number }> = [];
+
+  // Extract triples from each chunk using LLM
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+    
+    if (opts.verbose) {
+      console.log(`      Chunk ${i + 1}/${chunks.length}...`);
+    }
+
+    try {
+      const triples = await extractTriplesWithLLM(chunk, {
+        ollamaUrl: opts.ollamaUrl,
+        model: opts.model,
+        verbose: opts.verbose,
+      });
+
+      for (const triple of triples) {
+        // Add entities
+        const subjectKey = triple.subject.toLowerCase();
+        if (!allEntities.has(subjectKey)) {
+          allEntities.set(subjectKey, {
+            name: triple.subject,
+            type: triple.subject_type || "unknown",
+          });
+          stats.entitiesAdded++;
+        }
+
+        const objectKey = triple.object.toLowerCase();
+        if (!allEntities.has(objectKey)) {
+          allEntities.set(objectKey, {
+            name: triple.object,
+            type: triple.object_type || "unknown",
+          });
+          stats.entitiesAdded++;
+        }
+
+        // Add triple
+        allTriples.push({
+          subject: triple.subject,
+          predicate: triple.predicate,
+          object: triple.object,
+          confidence: 0.9, // High confidence from LLM
+        });
+        stats.triplesAdded++;
+      }
+    } catch (err: any) {
+      stats.errors.push(`LLM extraction failed for chunk ${i + 1}: ${err.message}`);
+    }
+  }
+
+  // Batch-write all entities and triples
+  if (!opts.dryRun && (allEntities.size > 0 || allTriples.length > 0)) {
+    graph.batch(() => {
+      // Write entities
+      for (const entity of allEntities.values()) {
+        graph.addEntity(entity.name, entity.type);
+      }
+
+      // Write triples
+      for (const triple of allTriples) {
+        graph.addTriple(triple.subject, triple.predicate, triple.object, {
+          confidence: triple.confidence,
+          source: `session:${filePath.split("/").slice(-1)[0]}`,
+        });
+      }
+    });
+  }
+
+  return stats;
+}
+
 // Process a single session file (line by line to handle large files)
 // Collects entities AND triples in memory, then batch-writes everything.
+// This is the NLP-based approach (fallback when LLM is not available)
 async function processSessionFile(
   graph: GraphDB,
   filePath: string,
@@ -462,7 +601,11 @@ export async function ingestSessions(
         console.log(`  [${i + 1}/${sessionFiles.length}] ${filePath.split("/").slice(-3).join("/")}`);
       }
 
-      const fileStats = await processSessionFile(graph, filePath, opts);
+      // Choose LLM or NLP processing
+      const fileStats = opts.useLLM
+        ? await processSessionFileWithLLM(graph, filePath, opts)
+        : await processSessionFile(graph, filePath, opts);
+
       stats.sessionsProcessed++;
       stats.messagesProcessed += fileStats.messagesProcessed;
       stats.entitiesAdded += fileStats.entitiesAdded;
