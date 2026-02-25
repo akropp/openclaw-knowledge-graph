@@ -25,7 +25,7 @@ A shared knowledge graph for storing and querying entity relationships across ag
 
 ## CLI Usage
 
-The `kg` command is available at: `skills/knowledge-graph/scripts/kg`
+The `kg` command is available at: `scripts/kg`
 
 ### Add a relationship
 ```bash
