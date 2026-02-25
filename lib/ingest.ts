@@ -183,10 +183,11 @@ export async function ingestSessions(
     console.log(`Found ${sessionFiles.length} session files to process`);
   }
 
-  for (const filePath of sessionFiles) {
+  for (let i = 0; i < sessionFiles.length; i++) {
+    const filePath = sessionFiles[i];
     try {
-      if (opts.verbose) {
-        console.log(`  Processing ${filePath}...`);
+      if (i % 50 === 0 || opts.verbose) {
+        console.log(`  [${i + 1}/${sessionFiles.length}] ${filePath.split("/").slice(-3).join("/")}`);
       }
 
       const fileStats = await processSessionFile(graph, filePath, opts);
@@ -197,15 +198,13 @@ export async function ingestSessions(
 
       if (opts.verbose) {
         console.log(
-          `  ✓ ${filePath} (${fileStats.messagesProcessed} messages, ${fileStats.entitiesAdded} entities)`
+          `    ✓ ${fileStats.messagesProcessed} messages, ${fileStats.entitiesAdded} entities`
         );
       }
     } catch (err) {
       const error = `Error processing ${filePath}: ${err}`;
       stats.errors.push(error);
-      if (opts.verbose) {
-        console.error(`  ✗ ${error}`);
-      }
+      console.error(`  ✗ ${filePath.split("/").slice(-3).join("/")}: ${err}`);
     }
   }
 
@@ -394,10 +393,14 @@ export function ingestMarkdown(
     console.log(`Found ${mdFiles.length} markdown files to process`);
   }
 
-  for (const filePath of mdFiles) {
+  for (let i = 0; i < mdFiles.length; i++) {
+    const filePath = mdFiles[i];
     try {
       const content = readFileSync(filePath, "utf-8");
       stats.filesProcessed++;
+      if (i % 20 === 0 || opts.verbose) {
+        console.log(`  [${i + 1}/${mdFiles.length}] ${filePath.split("/").slice(-3).join("/")}`);
+      }
 
       // Extract entities using the entity extraction library
       const entities = extractEntities(content, graph);
@@ -497,9 +500,7 @@ export function ingestFactmem(
       .prepare("SELECT entity, key, value, decay_tier, source FROM facts WHERE expires_at IS NULL OR expires_at > datetime('now')")
       .all() as Array<{ entity: string; key: string; value: string; decay_tier: string; source: string }>;
 
-    if (opts.verbose) {
-      console.log(`Found ${facts.length} facts to process`);
-    }
+    console.log(`  Found ${facts.length} facts to process`);
 
     for (const fact of facts) {
       try {
@@ -556,8 +557,8 @@ export function ingestFactmem(
           stats.propertiesAdded++;
         }
 
-        if (opts.verbose && stats.factsProcessed % 100 === 0) {
-          console.log(`  Processed ${stats.factsProcessed} facts...`);
+        if (stats.factsProcessed % 200 === 0) {
+          console.log(`  [${stats.factsProcessed}/${facts.length}] ${fact.entity}/${fact.key}`);
         }
       } catch (err) {
         const error = `Error processing fact for ${fact.entity}: ${err}`;
@@ -595,30 +596,26 @@ export async function ingestAll(
   };
 
   // Ingest sessions FIRST (highest priority)
-  if (opts.verbose) {
-    console.log("\n=== Ingesting Session Files ===");
-  }
+  console.log("\n=== Ingesting Session Files ===");
   const sessionStats = await ingestSessions(graph, sessionsDir, opts);
   combined.sessionsProcessed += sessionStats.sessionsProcessed;
   combined.messagesProcessed += sessionStats.messagesProcessed;
   combined.entitiesAdded += sessionStats.entitiesAdded;
   combined.errors.push(...sessionStats.errors);
+  console.log(`  Sessions done: ${sessionStats.sessionsProcessed} files, ${sessionStats.messagesProcessed} messages, ${sessionStats.entitiesAdded} entities`);
 
   // Ingest markdown
-  if (opts.verbose) {
-    console.log("\n=== Ingesting Markdown Files ===");
-  }
+  console.log("\n=== Ingesting Markdown Files ===");
   const mdStats = ingestMarkdown(graph, markdownPaths, opts);
   combined.filesProcessed += mdStats.filesProcessed;
   combined.entitiesAdded += mdStats.entitiesAdded;
   combined.triplesAdded += mdStats.triplesAdded;
   combined.propertiesAdded += mdStats.propertiesAdded;
   combined.errors.push(...mdStats.errors);
+  console.log(`  Markdown done: ${mdStats.filesProcessed} files, ${mdStats.entitiesAdded} entities, ${mdStats.triplesAdded} triples`);
 
   // Ingest factmem LAST
-  if (opts.verbose) {
-    console.log("\n=== Ingesting Factmem Database ===");
-  }
+  console.log("\n=== Ingesting Factmem Database ===");
   const factStats = ingestFactmem(graph, factsDbPath, opts);
   combined.entitiesAdded += factStats.entitiesAdded;
   combined.triplesAdded += factStats.triplesAdded;
