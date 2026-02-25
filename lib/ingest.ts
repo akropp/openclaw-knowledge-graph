@@ -306,26 +306,13 @@ function createCooccurrenceTriples(
   return triples;
 }
 
-// Process a single session file using LLM for triple extraction
-async function processSessionFileWithLLM(
-  graph: GraphDB,
+// Read messages from a single session file
+async function readMessagesFromFile(
   filePath: string,
   opts: IngestOptions
-): Promise<{ messagesProcessed: number; entitiesAdded: number; triplesAdded: number; propertiesAdded: number; errors: string[] }> {
-  if (!opts.ollamaUrl || !opts.model) {
-    throw new Error("LLM extraction requires ollamaUrl and model to be specified");
-  }
-
-  const stats = {
-    messagesProcessed: 0,
-    entitiesAdded: 0,
-    triplesAdded: 0,
-    propertiesAdded: 0,
-    errors: [] as string[]
-  };
-
-  // Collect messages
+): Promise<{ messages: Array<{ role: string; text: string }>; errors: string[] }> {
   const messages: Array<{ role: string; text: string }> = [];
+  const errors: string[] = [];
 
   await new Promise<void>((resolve) => {
     const fileStream = createReadStream(filePath, { encoding: "utf-8" });
@@ -344,7 +331,6 @@ async function processSessionFileWithLLM(
           const text = extractTextFromContent(obj.message.content);
           if (text && text.length > 10) {
             messages.push({ role: obj.message.role, text });
-            stats.messagesProcessed++;
           }
         }
       } catch (err) {
@@ -354,50 +340,106 @@ async function processSessionFileWithLLM(
 
     rl.on("close", () => resolve());
     rl.on("error", (err) => {
-      stats.errors.push(`Error reading ${filePath}: ${err}`);
+      errors.push(`Error reading ${filePath}: ${err}`);
       resolve();
     });
   });
 
-  if (messages.length === 0) {
-    return stats;
+  return { messages, errors };
+}
+
+// Batch-process multiple session files using LLM for triple extraction
+// Collects messages from multiple files, chunks them together, and sends to LLM
+async function processSessionFilesWithLLMBatched(
+  graph: GraphDB,
+  filePaths: string[],
+  opts: IngestOptions
+): Promise<{
+  filesProcessed: number;
+  messagesProcessed: number;
+  entitiesAdded: number;
+  triplesAdded: number;
+  propertiesAdded: number;
+  errors: string[];
+  filesSkipped: number;
+}> {
+  if (!opts.ollamaUrl || !opts.model) {
+    throw new Error("LLM extraction requires ollamaUrl and model to be specified");
   }
 
-  // Chunk messages for LLM processing
-  const chunks = chunkMessages(messages, opts.chunkSize);
+  const stats = {
+    filesProcessed: 0,
+    messagesProcessed: 0,
+    entitiesAdded: 0,
+    triplesAdded: 0,
+    propertiesAdded: 0,
+    errors: [] as string[],
+    filesSkipped: 0,
+  };
 
-  if (opts.verbose) {
-    console.log(`    Processing ${messages.length} messages in ${chunks.length} chunks with LLM...`);
+  const chunkSize = opts.chunkSize || 16000;
+
+  // Buffer for accumulating messages across files
+  interface MessageWithSource {
+    role: string;
+    text: string;
+    filePath: string;
   }
 
-  // Collect all entities and triples
+  const messageBuffer: MessageWithSource[] = [];
+  let bufferCharCount = 0;
+  const filesInCurrentBatch = new Set<string>();
+
+  // Track all entities and triples for batch writing
   const allEntities = new Map<string, { name: string; type: string }>();
-  const allTriples: Array<{ subject: string; predicate: string; object: string; confidence: number }> = [];
+  const allTriples: Array<{
+    subject: string;
+    predicate: string;
+    object: string;
+    confidence: number;
+    source: string;
+  }> = [];
 
-  // Extract triples from each chunk using LLM
-  for (let i = 0; i < chunks.length; i++) {
-    const chunk = chunks[i];
-    
+  // Process a batch of messages (flush buffer)
+  async function processBatch(): Promise<void> {
+    if (messageBuffer.length === 0) return;
+
+    // Format messages with session separators
+    const formattedText = formatMessagesWithSeparators(messageBuffer);
+
     if (opts.verbose) {
-      console.log(`      Chunk ${i + 1}/${chunks.length}...`);
+      console.log(
+        `    Processing batch: ${messageBuffer.length} messages from ${filesInCurrentBatch.size} files (${formattedText.length} chars)`
+      );
     }
 
     // Pre-filter: check if chunk has any entities using fast NLP extraction
-    const quickEntities = extractEntities(chunk);
+    const quickEntities = extractEntities(formattedText);
     if (quickEntities.length === 0) {
       if (opts.verbose) {
-        console.log(`      Skipping chunk ${i + 1} (no entities detected)`);
+        console.log(`      Skipping batch (no entities detected)`);
       }
-      continue;
+      // Mark files as processed even though we skipped them (no point retrying)
+      if (!opts.dryRun) {
+        for (const filePath of filesInCurrentBatch) {
+          markFileProcessed(graph, filePath);
+          stats.filesProcessed++;
+        }
+      }
+      return;
     }
 
     try {
-      const triples = await extractTriplesWithLLM(chunk, {
+      const triples = await extractTriplesWithLLM(formattedText, {
         ollamaUrl: opts.ollamaUrl!,
         model: opts.model!,
         apiKey: opts.apiKey,
         verbose: opts.verbose,
       });
+
+      if (opts.verbose) {
+        console.log(`      Extracted ${triples.length} triples`);
+      }
 
       for (const triple of triples) {
         // Add entities
@@ -419,22 +461,126 @@ async function processSessionFileWithLLM(
           stats.entitiesAdded++;
         }
 
-        // Add triple
+        // Add triple with source info
         allTriples.push({
           subject: triple.subject,
           predicate: triple.predicate,
           object: triple.object,
-          confidence: 0.9, // High confidence from LLM
+          confidence: 0.9,
+          source: `session:batch:${Array.from(filesInCurrentBatch).map((p) => p.split("/").slice(-1)[0]).join(",")}`,
         });
         stats.triplesAdded++;
       }
+
+      // SUCCESS: Mark all files in this batch as processed
+      if (!opts.dryRun) {
+        for (const filePath of filesInCurrentBatch) {
+          markFileProcessed(graph, filePath);
+          stats.filesProcessed++;
+        }
+      }
     } catch (err: any) {
-      stats.errors.push(`LLM extraction failed for chunk ${i + 1}: ${err.message}`);
+      // FAILURE: Don't mark any files as processed
+      stats.errors.push(`LLM extraction failed for batch: ${err.message}`);
+      if (opts.verbose) {
+        console.error(`      ✗ Batch failed, will retry files next run`);
+      }
+      stats.filesSkipped += filesInCurrentBatch.size;
     }
   }
 
-  // Batch-write all entities and triples
+  // Format messages with session separators
+  function formatMessagesWithSeparators(messages: MessageWithSource[]): string {
+    const lines: string[] = [];
+    let currentFile = "";
+
+    for (const msg of messages) {
+      if (msg.filePath !== currentFile) {
+        currentFile = msg.filePath;
+        const filename = msg.filePath.split("/").slice(-1)[0];
+        lines.push(`\n--- Session: ${filename} ---\n`);
+      }
+      lines.push(`[${msg.role}]: ${msg.text}\n`);
+    }
+
+    return lines.join("");
+  }
+
+  // Read and batch all files
+  for (let i = 0; i < filePaths.length; i++) {
+    const filePath = filePaths[i];
+
+    if (opts.verbose || i % 50 === 0) {
+      console.log(`  [${i + 1}/${filePaths.length}] ${filePath.split("/").slice(-3).join("/")}`);
+    }
+
+    // Read messages from file
+    const { messages, errors } = await readMessagesFromFile(filePath, opts);
+    stats.errors.push(...errors);
+
+    if (messages.length === 0) {
+      if (opts.verbose) {
+        console.log(`    Skipping (no messages)`);
+      }
+      // Mark empty files as processed
+      if (!opts.dryRun) {
+        markFileProcessed(graph, filePath);
+      }
+      stats.filesSkipped++;
+      continue;
+    }
+
+    // Calculate total message text length for this file
+    const messageTextLength = messages.reduce((sum, m) => sum + m.text.length, 0);
+
+    // Skip tiny sessions (< 100 chars)
+    if (messageTextLength < 100) {
+      if (opts.verbose) {
+        console.log(`    Skipping (< 100 chars of text)`);
+      }
+      // Mark tiny files as processed (not worth retrying)
+      if (!opts.dryRun) {
+        markFileProcessed(graph, filePath);
+      }
+      stats.filesSkipped++;
+      continue;
+    }
+
+    stats.messagesProcessed += messages.length;
+
+    // Add messages to buffer
+    for (const msg of messages) {
+      const msgWithSource: MessageWithSource = { ...msg, filePath };
+      const msgLength = msg.text.length + msg.role.length + 10; // Rough estimate with formatting
+
+      // Check if adding this message would exceed chunk size
+      if (bufferCharCount + msgLength > chunkSize && messageBuffer.length > 0) {
+        // Flush current batch
+        await processBatch();
+
+        // Clear buffer
+        messageBuffer.length = 0;
+        bufferCharCount = 0;
+        filesInCurrentBatch.clear();
+      }
+
+      messageBuffer.push(msgWithSource);
+      bufferCharCount += msgLength;
+      filesInCurrentBatch.add(filePath);
+    }
+  }
+
+  // Flush any remaining messages
+  if (messageBuffer.length > 0) {
+    await processBatch();
+  }
+
+  // Batch-write all entities and triples at the end
   if (!opts.dryRun && (allEntities.size > 0 || allTriples.length > 0)) {
+    if (opts.verbose) {
+      console.log(`\n  Writing ${allEntities.size} entities and ${allTriples.length} triples to graph...`);
+    }
+
     graph.batch(() => {
       // Write entities
       for (const entity of allEntities.values()) {
@@ -445,7 +591,7 @@ async function processSessionFileWithLLM(
       for (const triple of allTriples) {
         graph.addTriple(triple.subject, triple.predicate, triple.object, {
           confidence: triple.confidence,
-          source: `session:${filePath.split("/").slice(-1)[0]}`,
+          source: triple.source,
         });
       }
     });
@@ -678,52 +824,75 @@ export async function ingestSessions(
     console.log(`Processing ${filesToProcess.length} of ${sessionFiles.length} files`);
   }
 
-  for (let i = 0; i < filesToProcess.length; i++) {
-    const filePath = filesToProcess[i];
-    try {
-      if (i % 50 === 0 || opts.verbose) {
-        console.log(`  [${i + 1}/${filesToProcess.length}] ${filePath.split("/").slice(-3).join("/")}`);
-      }
+  // Choose processing mode: LLM (batched) or NLP (per-file)
+  if (opts.useLLM) {
+    // LLM mode: batch messages across multiple files
+    const batchStats = await processSessionFilesWithLLMBatched(graph, filesToProcess, opts);
+    
+    stats.filesProcessed = batchStats.filesProcessed;
+    stats.sessionsProcessed = batchStats.filesProcessed;
+    stats.messagesProcessed = batchStats.messagesProcessed;
+    stats.entitiesAdded = batchStats.entitiesAdded;
+    stats.triplesAdded = batchStats.triplesAdded;
+    stats.propertiesAdded = batchStats.propertiesAdded;
+    stats.errors.push(...batchStats.errors);
+    stats.filesSkipped = (stats.filesSkipped || 0) + batchStats.filesSkipped;
 
-      // Choose LLM or NLP processing
-      const fileStats = opts.useLLM
-        ? await processSessionFileWithLLM(graph, filePath, opts)
-        : await processSessionFile(graph, filePath, opts);
-
-      stats.sessionsProcessed++;
-      stats.messagesProcessed += fileStats.messagesProcessed;
-      stats.entitiesAdded += fileStats.entitiesAdded;
-      stats.triplesAdded += fileStats.triplesAdded;
-      stats.propertiesAdded += fileStats.propertiesAdded;
-      stats.errors.push(...fileStats.errors);
-
-      // Only mark as processed if we actually extracted something OR had no errors
-      // Don't mark files where every chunk failed (e.g. rate limits, timeouts)
-      if (!opts.dryRun && fileStats.errors.length === 0) {
-        markFileProcessed(graph, filePath);
-      } else if (!opts.dryRun && fileStats.errors.length > 0 && (fileStats.triplesAdded > 0 || fileStats.entitiesAdded > 0)) {
-        // Partial success — some chunks worked, some failed. Mark it so we don't redo the good parts,
-        // but log a warning
-        markFileProcessed(graph, filePath);
-        if (opts.verbose) {
-          console.log(`    ⚠ Partial success (${fileStats.errors.length} errors, but extracted ${fileStats.triplesAdded} triples)`);
+    if (opts.verbose) {
+      console.log(
+        `\n  ✓ LLM batch processing complete: ${stats.filesProcessed} files, ${stats.messagesProcessed} messages, ${stats.entitiesAdded} entities, ${stats.triplesAdded} triples`
+      );
+    }
+  } else {
+    // NLP mode: process each file independently (unchanged)
+    for (let i = 0; i < filesToProcess.length; i++) {
+      const filePath = filesToProcess[i];
+      try {
+        if (i % 50 === 0 || opts.verbose) {
+          console.log(`  [${i + 1}/${filesToProcess.length}] ${filePath.split("/").slice(-3).join("/")}`);
         }
-      } else if (fileStats.errors.length > 0) {
-        stats.filesSkipped = (stats.filesSkipped || 0) + 1;
-        if (opts.verbose) {
-          console.log(`    ✗ All chunks failed, will retry next run`);
-        }
-      }
 
-      if (opts.verbose) {
-        console.log(
-          `    ✓ ${fileStats.messagesProcessed} messages, ${fileStats.entitiesAdded} entities, ${fileStats.triplesAdded} triples`
-        );
+        const fileStats = await processSessionFile(graph, filePath, opts);
+
+        stats.sessionsProcessed++;
+        stats.messagesProcessed += fileStats.messagesProcessed;
+        stats.entitiesAdded += fileStats.entitiesAdded;
+        stats.triplesAdded += fileStats.triplesAdded;
+        stats.propertiesAdded += fileStats.propertiesAdded;
+        stats.errors.push(...fileStats.errors);
+
+        // Mark as processed if successful
+        if (!opts.dryRun && fileStats.errors.length === 0) {
+          markFileProcessed(graph, filePath);
+        } else if (
+          !opts.dryRun &&
+          fileStats.errors.length > 0 &&
+          (fileStats.triplesAdded > 0 || fileStats.entitiesAdded > 0)
+        ) {
+          // Partial success
+          markFileProcessed(graph, filePath);
+          if (opts.verbose) {
+            console.log(
+              `    ⚠ Partial success (${fileStats.errors.length} errors, but extracted ${fileStats.triplesAdded} triples)`
+            );
+          }
+        } else if (fileStats.errors.length > 0) {
+          stats.filesSkipped = (stats.filesSkipped || 0) + 1;
+          if (opts.verbose) {
+            console.log(`    ✗ All chunks failed, will retry next run`);
+          }
+        }
+
+        if (opts.verbose) {
+          console.log(
+            `    ✓ ${fileStats.messagesProcessed} messages, ${fileStats.entitiesAdded} entities, ${fileStats.triplesAdded} triples`
+          );
+        }
+      } catch (err) {
+        const error = `Error processing ${filePath}: ${err}`;
+        stats.errors.push(error);
+        console.error(`  ✗ ${filePath.split("/").slice(-3).join("/")}: ${err}`);
       }
-    } catch (err) {
-      const error = `Error processing ${filePath}: ${err}`;
-      stats.errors.push(error);
-      console.error(`  ✗ ${filePath.split("/").slice(-3).join("/")}: ${err}`);
     }
   }
 
