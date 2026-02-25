@@ -84,6 +84,12 @@ export default function register(api: any): void {
           description: "Number of hops for query (default 2)",
           default: 2,
         },
+        kind: {
+          type: "string",
+          enum: ["relationships", "properties", "all"],
+          description: "Filter query results: relationships (exclude has_* predicates), properties (only has_* predicates), or all (default)",
+          default: "all",
+        },
         confidence: {
           type: "number",
           description: "Confidence score 0-1 for add (default 1.0)",
@@ -110,6 +116,7 @@ export default function register(api: any): void {
             const results = graph.query(
               params.entity as string,
               (params.hops as number) || config.maxHops || 2,
+              { kind: params.kind as "relationships" | "properties" | "all" | undefined },
             );
             return json(results);
           }

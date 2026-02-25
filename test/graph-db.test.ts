@@ -117,6 +117,101 @@ describe("GraphDB", () => {
     });
   });
 
+  describe("query filtering", () => {
+    beforeEach(() => {
+      // Create a graph with both relationships and property-like triples
+      db.addTriple("Emily", "studies_at", "MIT");
+      db.addTriple("Emily", "dating", "Alex");
+      db.addTriple("Emily", "has_phone", "555-1234");
+      db.addTriple("Emily", "has_email", "emily@example.com");
+      db.addTriple("Emily", "has_age", "22");
+      db.addTriple("MIT", "located_in", "Boston");
+      db.addTriple("Alex", "works_at", "Google");
+    });
+
+    it("returns all triples when kind is 'all' (default)", () => {
+      const results = db.query("emily", 1, { kind: "all" });
+      const paths = results.filter(r => r.depth > 0).map(r => r.path);
+      
+      // Should include both relationships and properties
+      expect(paths.some(p => p.includes("studies_at"))).toBe(true);
+      expect(paths.some(p => p.includes("dating"))).toBe(true);
+      expect(paths.some(p => p.includes("has_phone"))).toBe(true);
+      expect(paths.some(p => p.includes("has_email"))).toBe(true);
+    });
+
+    it("excludes property triples when kind is 'relationships'", () => {
+      const results = db.query("emily", 1, { kind: "relationships" });
+      const paths = results.filter(r => r.depth > 0).map(r => r.path);
+      
+      // Should include relationships
+      expect(paths.some(p => p.includes("studies_at"))).toBe(true);
+      expect(paths.some(p => p.includes("dating"))).toBe(true);
+      
+      // Should exclude property-like predicates
+      expect(paths.some(p => p.includes("has_phone"))).toBe(false);
+      expect(paths.some(p => p.includes("has_email"))).toBe(false);
+      expect(paths.some(p => p.includes("has_age"))).toBe(false);
+    });
+
+    it("includes only property triples when kind is 'properties'", () => {
+      const results = db.query("emily", 1, { kind: "properties" });
+      const paths = results.filter(r => r.depth > 0).map(r => r.path);
+      
+      // Should exclude relationships
+      expect(paths.some(p => p.includes("studies_at"))).toBe(false);
+      expect(paths.some(p => p.includes("dating"))).toBe(false);
+      
+      // Should include property-like predicates
+      expect(paths.some(p => p.includes("has_phone"))).toBe(true);
+      expect(paths.some(p => p.includes("has_email"))).toBe(true);
+      expect(paths.some(p => p.includes("has_age"))).toBe(true);
+    });
+
+    it("filters correctly with multi-hop traversal", () => {
+      const results = db.query("emily", 2, { kind: "relationships" });
+      const paths = results.filter(r => r.depth > 0).map(r => r.path);
+      
+      // Should traverse relationships at depth 2
+      expect(paths.some(p => p.includes("located_in"))).toBe(true);
+      expect(paths.some(p => p.includes("works_at"))).toBe(true);
+      
+      // Should not include any has_* predicates
+      expect(paths.some(p => p.includes("has_"))).toBe(false);
+    });
+
+    it("always includes root entity at depth 0", () => {
+      const allResults = db.query("emily", 2, { kind: "all" });
+      const relResults = db.query("emily", 2, { kind: "relationships" });
+      const propResults = db.query("emily", 2, { kind: "properties" });
+      
+      // All queries should include the root entity
+      expect(allResults.some(r => r.depth === 0 && r.name === "emily")).toBe(true);
+      expect(relResults.some(r => r.depth === 0 && r.name === "emily")).toBe(true);
+      expect(propResults.some(r => r.depth === 0 && r.name === "emily")).toBe(true);
+    });
+
+    it("handles filtering when no triples match the kind", () => {
+      // Create an entity with only properties
+      db.addTriple("John", "has_phone", "555-9999");
+      
+      const results = db.query("john", 1, { kind: "relationships" });
+      // Should only include the root entity
+      expect(results.length).toBe(1);
+      expect(results[0].depth).toBe(0);
+      expect(results[0].name).toBe("john");
+    });
+
+    it("handles filtering with no opts parameter (defaults to 'all')", () => {
+      const results = db.query("emily", 1);
+      const paths = results.filter(r => r.depth > 0).map(r => r.path);
+      
+      // Should behave the same as kind: "all"
+      expect(paths.some(p => p.includes("studies_at"))).toBe(true);
+      expect(paths.some(p => p.includes("has_phone"))).toBe(true);
+    });
+  });
+
   describe("search", () => {
     it("finds entities by name", () => {
       db.addEntity("Alice Johnson", "person");

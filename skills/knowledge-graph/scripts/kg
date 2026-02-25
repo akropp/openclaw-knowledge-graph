@@ -65,11 +65,18 @@ program
   .command("query <entity>")
   .description("Multi-hop traversal from an entity")
   .option("--hops <n>", "Number of hops", "2")
+  .option("--kind <type>", "Filter type: relationships|properties|all", "all")
   .option("--format <fmt>", "Output format: human|jsonl", "human")
   .action((entity, opts) => {
     const db = openDb(program.opts());
     try {
-      const results = db.query(entity, parseInt(opts.hops));
+      const kind = opts.kind;
+      if (!["relationships", "properties", "all"].includes(kind)) {
+        console.error(`Invalid kind: ${kind}. Must be one of: relationships, properties, all`);
+        process.exitCode = 1;
+        return;
+      }
+      const results = db.query(entity, parseInt(opts.hops), { kind });
       if (opts.format === "jsonl") {
         for (const r of results) {
           console.log(JSON.stringify({ text: r.path, score: 1.0 / (r.depth + 1), source: "graph", meta: { depth: r.depth, entity_id: r.entity_id } }));

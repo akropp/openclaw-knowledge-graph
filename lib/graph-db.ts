@@ -70,6 +70,10 @@ export interface PruneOpts {
   dryRun?: boolean;
 }
 
+export interface QueryOpts {
+  kind?: "relationships" | "properties" | "all";
+}
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS entities (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -215,19 +219,27 @@ export class GraphDB {
     return row.id;
   }
 
-  query(entityName: string, hops: number = 2): HopResult[] {
+  query(entityName: string, hops: number = 2, opts?: QueryOpts): HopResult[] {
     const canonical = entityName.toLowerCase().trim();
+    const kind = opts?.kind ?? "all";
+
+    // Define property predicates to filter out when kind="relationships"
+    const propertyPredicates = [
+      "has_phone", "has_email", "has_age", "has_address", "has_birthday",
+      "has_website", "has_linkedin", "has_twitter", "has_github", "has_note"
+    ];
 
     const stmt = this.db.prepare(`
-      WITH RECURSIVE hops(entity_id, depth, path, visited) AS (
-        SELECT id, 0, name, ',' || name || ','
+      WITH RECURSIVE hops(entity_id, depth, path, visited, predicate) AS (
+        SELECT id, 0, name, ',' || name || ',', NULL
         FROM entities WHERE name = ?
         UNION ALL
         SELECT
           CASE WHEN t.subject_id = h.entity_id THEN t.object_id ELSE t.subject_id END,
           h.depth + 1,
           h.path || ' -> ' || t.predicate || ' -> ' || e2.name,
-          h.visited || e2.name || ','
+          h.visited || e2.name || ',',
+          t.predicate
         FROM hops h
         JOIN triples t ON t.subject_id = h.entity_id OR t.object_id = h.entity_id
         JOIN entities e2 ON e2.id = CASE WHEN t.subject_id = h.entity_id THEN t.object_id ELSE t.subject_id END
@@ -236,10 +248,39 @@ export class GraphDB {
       SELECT h.entity_id, h.depth, h.path, e.name, e.entity_type
       FROM hops h
       JOIN entities e ON e.id = h.entity_id
+      WHERE h.depth = 0 OR h.predicate IS NOT NULL
       ORDER BY h.depth
     `);
 
-    return stmt.all(canonical, hops) as HopResult[];
+    const allResults = stmt.all(canonical, hops) as HopResult[];
+
+    // Filter results based on kind
+    if (kind === "all") {
+      return allResults;
+    }
+
+    return allResults.filter((result, idx) => {
+      // Always keep the root entity (depth 0)
+      if (result.depth === 0) return true;
+
+      // Extract predicate from the path for filtering
+      // Path format: "entity -> predicate -> entity2 -> predicate2 -> entity3"
+      const pathParts = result.path.split(" -> ");
+      if (pathParts.length < 3) return true; // Shouldn't happen, but be safe
+
+      // Get the last predicate in the path (most recent hop)
+      const lastPredicate = pathParts[pathParts.length - 2];
+
+      const isProperty = lastPredicate.startsWith("has_") || propertyPredicates.includes(lastPredicate);
+
+      if (kind === "relationships") {
+        return !isProperty;
+      } else if (kind === "properties") {
+        return isProperty;
+      }
+
+      return true;
+    });
   }
 
   search(text: string): Entity[] {
