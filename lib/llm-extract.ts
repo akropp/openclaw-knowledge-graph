@@ -55,13 +55,31 @@ export interface LLMExtractOptions {
 }
 
 const SYSTEM_PROMPT = `Extract knowledge triples from this conversation. Return ONLY valid JSON lines, one per triple:
-{"subject":"Emily Kropp","predicate":"studies_at","object":"LIM College","subject_type":"person","object_type":"organization"}
+{"subject":"Adam Kropp","predicate":"parent_of","object":"Emily Kropp","subject_type":"person","object_type":"person"}
+
+DIRECTIONALITY IS CRITICAL. The subject is always the actor, owner, or "bigger" entity:
+- parent_of: the PARENT is the subject → "Adam Kropp" parent_of "Emily Kropp" (NOT Emily parent_of Adam)
+- works_at: the PERSON is the subject → "Adam" works_at "Company" (NOT Company works_at Adam)
+- manages: the MANAGER is the subject → "Adam" manages "Gilfoyle" (NOT Gilfoyle manages Adam)
+- lives_in: the PERSON is the subject → "Emily" lives_in "NYC"
+- married_to: either direction is fine (symmetric)
+- dating: either direction is fine (symmetric)
+
+Canonical predicates (use ONLY these, pick ONE direction per relationship):
+- People: parent_of, child_of, married_to, sibling_of, dating, has_phone, has_email, has_age, born_on
+- Work: works_at, manages, member_of, collaborates_with
+- Location: lives_in, located_in
+- Education: studies_at, attends
+- Tech: runs_on, hosted_on, uses, built_with
+
+NEVER emit contradictory pairs. If Adam manages Gilfoyle, do NOT also emit Adam managed_by Gilfoyle.
+Pick child_of OR parent_of for a given pair, not both. child_of means the CHILD is the subject.
 
 Rules:
 - Only extract factual relationships about real people, places, organizations, services
-- Ignore technical implementation details, code, configs
-- Normalize names (full names when possible)
-- Use clear predicates: lives_in, works_at, studies_at, dating, married_to, parent_of, child_of, has_phone, has_email, born_on, has_age, member_of, located_in, runs_on, managed_by
+- AI agents (Clawd, Gilfoyle, Monty, Sterling) are software — Adam manages/uses them, not the reverse
+- Ignore technical implementation details, code, configs, debugging
+- Normalize names (full names when known)
 - Skip vague or uncertain relationships
 - Skip entities that are code, file paths, or technical artifacts
 - Return one JSON object per line, no other text`;

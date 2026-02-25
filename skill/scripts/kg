@@ -5,21 +5,21 @@ import { readFileSync, existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { createInterface } from "node:readline";
 import { program } from "commander";
-import { GraphDB } from "../../../dist/lib/graph-db.js";
-import { fuse } from "../../../dist/lib/rrf.js";
+import { GraphDB } from "../../dist/lib/graph-db.js";
+import { fuse } from "../../dist/lib/rrf.js";
 import { 
   loadConfig,
   saveConfig,
   CONFIG_PATH,
   getConfigValue,
   setConfigValue
-} from "../../../dist/lib/config.js";
+} from "../../dist/lib/config.js";
 import {
   ingestSessions,
   ingestMarkdown,
   ingestFactmem,
   ingestAll
-} from "../../../dist/lib/ingest.js";
+} from "../../dist/lib/ingest.js";
 
 function getDbPath(opts) {
   if (opts?.db) return resolve(opts.db);
