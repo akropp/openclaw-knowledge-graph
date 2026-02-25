@@ -234,7 +234,12 @@ program
   .command("ingest")
   .alias("seed")
   .description("Seed the knowledge graph from existing data sources")
-  .option("--source <type>", "Data source: markdown, factmem, or all (default: all)", "all")
+  .option("--source <type>", "Data source: sessions, markdown, factmem, or all (default: all)", "all")
+  .option(
+    "--sessions-dir <path>",
+    "Base directory for session files (default: ~/.openclaw/agents)",
+    resolve(homedir(), ".openclaw", "agents")
+  )
   .option(
     "--paths <paths...>",
     "Markdown paths to scan (default: shared and agent memory dirs)",
@@ -254,7 +259,7 @@ program
   .option("--dry-run", "Show what would be ingested without adding to graph")
   .option("--verbose", "Show detailed progress")
   .action(async (opts) => {
-    const { ingestMarkdown, ingestFactmem, ingestAll } = await import("../../../dist/lib/ingest.js");
+    const { ingestSessions, ingestMarkdown, ingestFactmem, ingestAll } = await import("../../../dist/lib/ingest.js");
     const db = openDb(program.opts());
 
     try {
@@ -274,6 +279,10 @@ program
       const ingestOpts = { dryRun: opts.dryRun, verbose: opts.verbose };
 
       switch (opts.source.toLowerCase()) {
+        case "sessions":
+        case "session":
+          stats = await ingestSessions(db, opts.sessionsDir, ingestOpts);
+          break;
         case "markdown":
         case "md":
           stats = ingestMarkdown(db, opts.paths, ingestOpts);
@@ -284,12 +293,16 @@ program
           break;
         case "all":
         default:
-          stats = ingestAll(db, opts.paths, opts.factsDb, ingestOpts);
+          stats = await ingestAll(db, opts.sessionsDir, opts.paths, opts.factsDb, ingestOpts);
           break;
       }
 
       console.log();
       console.log("=== Ingestion Summary ===");
+      if (opts.source === "sessions" || opts.source === "all") {
+        console.log(`Session files processed: ${stats.sessionsProcessed}`);
+        console.log(`Messages processed: ${stats.messagesProcessed}`);
+      }
       if (opts.source === "markdown" || opts.source === "all") {
         console.log(`Markdown files processed: ${stats.filesProcessed}`);
       }

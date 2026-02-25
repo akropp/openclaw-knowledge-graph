@@ -1,5 +1,6 @@
-import { readdirSync, statSync, readFileSync, existsSync } from "node:fs";
+import { readdirSync, statSync, readFileSync, existsSync, createReadStream } from "node:fs";
 import { join } from "node:path";
+import { createInterface } from "node:readline";
 import Database from "better-sqlite3";
 import type { GraphDB } from "./graph-db.js";
 import { extractEntities } from "./entity-extract.js";
@@ -10,6 +11,8 @@ export interface IngestStats {
   triplesAdded: number;
   propertiesAdded: number;
   factsProcessed: number;
+  sessionsProcessed: number;
+  messagesProcessed: number;
   errors: string[];
 }
 
@@ -50,6 +53,163 @@ const FACT_KEY_MAP: Record<string, string> = {
 function normalizePredicate(key: string): string {
   const normalized = key.toLowerCase().trim().replace(/\s+/g, "_");
   return FACT_KEY_MAP[normalized] || `has_${normalized}`;
+}
+
+// Find all session JSONL files
+function findSessionFiles(baseDir: string = "/home/clawd/.openclaw/agents"): string[] {
+  if (!existsSync(baseDir)) return [];
+
+  const results: string[] = [];
+  try {
+    const agents = readdirSync(baseDir);
+    for (const agent of agents) {
+      const sessionsDir = join(baseDir, agent, "sessions");
+      if (!existsSync(sessionsDir)) continue;
+
+      try {
+        const entries = readdirSync(sessionsDir);
+        for (const entry of entries) {
+          if (entry.endsWith(".jsonl") || entry.match(/\.jsonl\.reset\.\d+$/)) {
+            results.push(join(sessionsDir, entry));
+          }
+        }
+      } catch {
+        // Skip directories we can't read
+      }
+    }
+  } catch {
+    // Skip if base directory can't be read
+  }
+  return results;
+}
+
+// Extract text content from message content (string or content blocks)
+function extractTextFromContent(content: any): string {
+  if (typeof content === "string") {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    return content
+      .filter((block) => block.type === "text")
+      .map((block) => block.text || "")
+      .join("\n");
+  }
+  return "";
+}
+
+// Process a single session file (line by line to handle large files)
+async function processSessionFile(
+  graph: GraphDB,
+  filePath: string,
+  opts: IngestOptions
+): Promise<{ messagesProcessed: number; entitiesAdded: number; errors: string[] }> {
+  const stats: { messagesProcessed: number; entitiesAdded: number; errors: string[] } = { 
+    messagesProcessed: 0, 
+    entitiesAdded: 0, 
+    errors: [] 
+  };
+
+  return new Promise((resolve) => {
+    const fileStream = createReadStream(filePath, { encoding: "utf-8" });
+    const rl = createInterface({ input: fileStream, crlfDelay: Infinity });
+
+    rl.on("line", (line) => {
+      try {
+        const obj = JSON.parse(line);
+
+        // Filter to only message types with user or assistant role
+        if (
+          obj.type === "message" &&
+          obj.message &&
+          (obj.message.role === "user" || obj.message.role === "assistant")
+        ) {
+          const text = extractTextFromContent(obj.message.content);
+          if (text && text.length > 0) {
+            stats.messagesProcessed++;
+
+            // Extract entities from the message text
+            const entities = extractEntities(text, graph);
+            for (const entity of entities) {
+              if (!opts.dryRun) {
+                graph.addEntity(entity.name, entity.type);
+              }
+              stats.entitiesAdded++;
+            }
+
+            if (opts.verbose && stats.messagesProcessed % 100 === 0) {
+              console.log(`    Processed ${stats.messagesProcessed} messages...`);
+            }
+          }
+        }
+      } catch (err) {
+        // Skip invalid JSON lines (non-fatal)
+        if (opts.verbose) {
+          stats.errors.push(`Invalid JSON in ${filePath}: ${err}`);
+        }
+      }
+    });
+
+    rl.on("close", () => {
+      resolve(stats);
+    });
+
+    rl.on("error", (err) => {
+      stats.errors.push(`Error reading ${filePath}: ${err}`);
+      resolve(stats);
+    });
+  });
+}
+
+export async function ingestSessions(
+  graph: GraphDB,
+  baseDir: string = "/home/clawd/.openclaw/agents",
+  opts: IngestOptions = {}
+): Promise<IngestStats> {
+  const stats: IngestStats = {
+    filesProcessed: 0,
+    entitiesAdded: 0,
+    triplesAdded: 0,
+    propertiesAdded: 0,
+    factsProcessed: 0,
+    sessionsProcessed: 0,
+    messagesProcessed: 0,
+    errors: [],
+  };
+
+  // Find all session files
+  const sessionFiles = findSessionFiles(baseDir);
+
+  if (opts.verbose) {
+    console.log(`Found ${sessionFiles.length} session files to process`);
+  }
+
+  for (const filePath of sessionFiles) {
+    try {
+      if (opts.verbose) {
+        console.log(`  Processing ${filePath}...`);
+      }
+
+      const fileStats = await processSessionFile(graph, filePath, opts);
+      stats.sessionsProcessed++;
+      stats.messagesProcessed += fileStats.messagesProcessed;
+      stats.entitiesAdded += fileStats.entitiesAdded;
+      stats.errors.push(...fileStats.errors);
+
+      if (opts.verbose) {
+        console.log(
+          `  ✓ ${filePath} (${fileStats.messagesProcessed} messages, ${fileStats.entitiesAdded} entities)`
+        );
+      }
+    } catch (err) {
+      const error = `Error processing ${filePath}: ${err}`;
+      stats.errors.push(error);
+      if (opts.verbose) {
+        console.error(`  ✗ ${error}`);
+      }
+    }
+  }
+
+  return stats;
 }
 
 // Recursively find all .md files in a directory
@@ -219,6 +379,8 @@ export function ingestMarkdown(
     triplesAdded: 0,
     propertiesAdded: 0,
     factsProcessed: 0,
+    sessionsProcessed: 0,
+    messagesProcessed: 0,
     errors: [],
   };
 
@@ -317,6 +479,8 @@ export function ingestFactmem(
     triplesAdded: 0,
     propertiesAdded: 0,
     factsProcessed: 0,
+    sessionsProcessed: 0,
+    messagesProcessed: 0,
     errors: [],
   };
 
@@ -412,20 +576,33 @@ export function ingestFactmem(
   return stats;
 }
 
-export function ingestAll(
+export async function ingestAll(
   graph: GraphDB,
+  sessionsDir: string,
   markdownPaths: string[],
   factsDbPath: string,
   opts: IngestOptions = {}
-): IngestStats {
+): Promise<IngestStats> {
   const combined: IngestStats = {
     filesProcessed: 0,
     entitiesAdded: 0,
     triplesAdded: 0,
     propertiesAdded: 0,
     factsProcessed: 0,
+    sessionsProcessed: 0,
+    messagesProcessed: 0,
     errors: [],
   };
+
+  // Ingest sessions FIRST (highest priority)
+  if (opts.verbose) {
+    console.log("\n=== Ingesting Session Files ===");
+  }
+  const sessionStats = await ingestSessions(graph, sessionsDir, opts);
+  combined.sessionsProcessed += sessionStats.sessionsProcessed;
+  combined.messagesProcessed += sessionStats.messagesProcessed;
+  combined.entitiesAdded += sessionStats.entitiesAdded;
+  combined.errors.push(...sessionStats.errors);
 
   // Ingest markdown
   if (opts.verbose) {
@@ -438,7 +615,7 @@ export function ingestAll(
   combined.propertiesAdded += mdStats.propertiesAdded;
   combined.errors.push(...mdStats.errors);
 
-  // Ingest factmem
+  // Ingest factmem LAST
   if (opts.verbose) {
     console.log("\n=== Ingesting Factmem Database ===");
   }

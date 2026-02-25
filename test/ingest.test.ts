@@ -3,7 +3,163 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { GraphDB } from "../lib/graph-db.js";
-import { ingestMarkdown, ingestFactmem, ingestAll } from "../lib/ingest.js";
+import { ingestSessions, ingestMarkdown, ingestFactmem, ingestAll } from "../lib/ingest.js";
+
+describe("ingestSessions", () => {
+  let testDir: string;
+  let graph: GraphDB;
+
+  beforeEach(() => {
+    testDir = mkdtempSync(join(tmpdir(), "kg-test-sessions-"));
+    graph = new GraphDB();
+  });
+
+  afterEach(() => {
+    graph.close();
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it("processes session JSONL files with user and assistant messages", async () => {
+    // Create a test session file structure
+    const agentDir = join(testDir, "test-agent", "sessions");
+    mkdirSync(agentDir, { recursive: true });
+
+    const sessionData = [
+      { type: "message", message: { role: "user", content: "I need to talk to Alice Johnson about the project." } },
+      { type: "message", message: { role: "assistant", content: "I'll help you contact Alice at Google." } },
+      { type: "message", message: { role: "user", content: "Thanks!" } },
+      { type: "other", data: "ignore this" },
+    ];
+
+    const sessionFile = join(agentDir, "test-session.jsonl");
+    writeFileSync(sessionFile, sessionData.map((d) => JSON.stringify(d)).join("\n"));
+
+    const stats = await ingestSessions(graph, testDir);
+
+    expect(stats.sessionsProcessed).toBe(1);
+    expect(stats.messagesProcessed).toBe(3); // Three user/assistant messages (ignore "other" type)
+    expect(stats.entitiesAdded).toBeGreaterThan(0);
+
+    // Verify entities were extracted
+    const entities = graph.exportAll().entities;
+    const names = entities.map((e) => e.name.toLowerCase());
+    expect(names.some((n) => n.includes("alice"))).toBe(true);
+  });
+
+  it("handles content blocks with text type", async () => {
+    const agentDir = join(testDir, "test-agent", "sessions");
+    mkdirSync(agentDir, { recursive: true });
+
+    const sessionData = [
+      {
+        type: "message",
+        message: {
+          role: "user",
+          content: [
+            { type: "text", text: "Contact Bob Smith at Microsoft." },
+            { type: "image", url: "http://example.com/image.png" },
+          ],
+        },
+      },
+    ];
+
+    const sessionFile = join(agentDir, "test-session.jsonl");
+    writeFileSync(sessionFile, sessionData.map((d) => JSON.stringify(d)).join("\n"));
+
+    const stats = await ingestSessions(graph, testDir);
+
+    expect(stats.messagesProcessed).toBe(1);
+    expect(stats.entitiesAdded).toBeGreaterThan(0);
+
+    // Verify entity extraction from text blocks only
+    const entities = graph.exportAll().entities;
+    const names = entities.map((e) => e.name.toLowerCase());
+    expect(names.some((n) => n.includes("bob"))).toBe(true);
+  });
+
+  it("processes .jsonl.reset.* files", async () => {
+    const agentDir = join(testDir, "test-agent", "sessions");
+    mkdirSync(agentDir, { recursive: true });
+
+    const sessionData = [
+      { type: "message", message: { role: "user", content: "Talk to Carol at Tesla." } },
+    ];
+
+    const sessionFile = join(agentDir, "test-session.jsonl.reset.12345");
+    writeFileSync(sessionFile, sessionData.map((d) => JSON.stringify(d)).join("\n"));
+
+    const stats = await ingestSessions(graph, testDir);
+
+    expect(stats.sessionsProcessed).toBe(1);
+    expect(stats.messagesProcessed).toBe(1);
+  });
+
+  it("handles dry-run mode", async () => {
+    const agentDir = join(testDir, "test-agent", "sessions");
+    mkdirSync(agentDir, { recursive: true });
+
+    const sessionData = [
+      { type: "message", message: { role: "user", content: "Contact David at Apple." } },
+    ];
+
+    const sessionFile = join(agentDir, "test-session.jsonl");
+    writeFileSync(sessionFile, sessionData.map((d) => JSON.stringify(d)).join("\n"));
+
+    const stats = await ingestSessions(graph, testDir, { dryRun: true });
+
+    expect(stats.sessionsProcessed).toBe(1);
+    expect(stats.messagesProcessed).toBe(1);
+    expect(stats.entitiesAdded).toBeGreaterThan(0);
+
+    // Verify nothing was actually added to the graph
+    const entities = graph.exportAll().entities;
+    expect(entities).toHaveLength(0);
+  });
+
+  it("handles invalid JSON lines gracefully", async () => {
+    const agentDir = join(testDir, "test-agent", "sessions");
+    mkdirSync(agentDir, { recursive: true });
+
+    const content = [
+      '{"type":"message","message":{"role":"user","content":"Valid message"}}',
+      'invalid json here',
+      '{"type":"message","message":{"role":"assistant","content":"Another valid message"}}',
+    ].join("\n");
+
+    const sessionFile = join(agentDir, "test-session.jsonl");
+    writeFileSync(sessionFile, content);
+
+    const stats = await ingestSessions(graph, testDir);
+
+    expect(stats.sessionsProcessed).toBe(1);
+    expect(stats.messagesProcessed).toBe(2); // Should process valid lines
+  });
+
+  it("handles missing sessions directory", async () => {
+    const stats = await ingestSessions(graph, "/nonexistent/path");
+
+    expect(stats.sessionsProcessed).toBe(0);
+    expect(stats.errors).toHaveLength(0);
+  });
+
+  it("processes multiple agent directories", async () => {
+    const agent1Dir = join(testDir, "agent1", "sessions");
+    const agent2Dir = join(testDir, "agent2", "sessions");
+    mkdirSync(agent1Dir, { recursive: true });
+    mkdirSync(agent2Dir, { recursive: true });
+
+    const sessionData = [
+      { type: "message", message: { role: "user", content: "Test message." } },
+    ];
+
+    writeFileSync(join(agent1Dir, "session1.jsonl"), JSON.stringify(sessionData[0]));
+    writeFileSync(join(agent2Dir, "session2.jsonl"), JSON.stringify(sessionData[0]));
+
+    const stats = await ingestSessions(graph, testDir);
+
+    expect(stats.sessionsProcessed).toBe(2);
+  });
+});
 
 describe("ingestMarkdown", () => {
   let testDir: string;
@@ -218,37 +374,50 @@ describe("ingestFactmem", () => {
 
 describe("ingestAll", () => {
   let testDir: string;
+  let sessionsDir: string;
   let graph: GraphDB;
 
   beforeEach(() => {
     testDir = mkdtempSync(join(tmpdir(), "kg-test-"));
+    sessionsDir = mkdtempSync(join(tmpdir(), "kg-test-sessions-"));
     graph = new GraphDB();
   });
 
   afterEach(() => {
     graph.close();
     rmSync(testDir, { recursive: true, force: true });
+    rmSync(sessionsDir, { recursive: true, force: true });
   });
 
-  it("ingests both markdown and factmem", () => {
-    const content = "Alice lives in Boston.";
+  it("ingests sessions, markdown, and factmem in order", async () => {
+    // Create a session file
+    const agentDir = join(sessionsDir, "test-agent", "sessions");
+    mkdirSync(agentDir, { recursive: true });
+    const sessionData = [
+      { type: "message", message: { role: "user", content: "Contact Alice." } },
+    ];
+    writeFileSync(join(agentDir, "test.jsonl"), JSON.stringify(sessionData[0]));
+
+    // Create a markdown file
+    const content = "Bob lives in Boston.";
     const mdFile = join(testDir, "test.md");
     writeFileSync(mdFile, content);
 
     const factsPath = "/home/clawd/shared/facts.db";
-    const stats = ingestAll(graph, [testDir], factsPath);
+    const stats = await ingestAll(graph, sessionsDir, [testDir], factsPath);
 
+    expect(stats.sessionsProcessed).toBe(1);
     expect(stats.filesProcessed).toBe(1);
     // Can't guarantee factmem results without knowing if the file exists
   });
 
-  it("respects dry-run mode", () => {
-    const content = "Bob works at Google.";
+  it("respects dry-run mode", async () => {
+    const content = "Carol works at Google.";
     const mdFile = join(testDir, "test.md");
     writeFileSync(mdFile, content);
 
     const factsPath = "/home/clawd/shared/facts.db";
-    const stats = ingestAll(graph, [testDir], factsPath, { dryRun: true });
+    const stats = await ingestAll(graph, sessionsDir, [testDir], factsPath, { dryRun: true });
 
     expect(stats.filesProcessed).toBe(1);
 
