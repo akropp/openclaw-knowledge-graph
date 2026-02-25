@@ -728,12 +728,140 @@ program
 
       // ── Phase 2: LLM Review ──────────────────────────────────────────────
       if (opts.llm) {
-        console.log("\n=== Phase 2: LLM Review ===\n");
         const config = loadConfig();
         const llmUrl = config.llm?.baseUrl || "http://mac-mini.tailcd0984.ts.net:11434";
         const llmModel = config.llm?.model || "qwen2.5:14b";
         const apiKey = config.llm?.apiKey;
 
+        // Helper: call LLM and parse JSON array response
+        async function llmCall(prompt) {
+          let responseText;
+          if (apiKey) {
+            const baseUrl = llmUrl.replace(/\/+$/, "");
+            const resp = await fetch(`${baseUrl}/chat/completions`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
+              body: JSON.stringify({ model: llmModel, messages: [{ role: "user", content: prompt }], temperature: 0 }),
+            });
+            const data = await resp.json();
+            responseText = data.choices?.[0]?.message?.content || "[]";
+          } else {
+            const resp = await fetch(`${llmUrl}/api/chat`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ model: llmModel, messages: [{ role: "user", content: prompt }], stream: false, options: { temperature: 0 } }),
+            });
+            const data = await resp.json();
+            responseText = data.message?.content || "[]";
+          }
+          const jsonMatch = responseText.match(/\[[\s\S]*\]/);
+          if (!jsonMatch) return [];
+          try { return JSON.parse(jsonMatch[0]); } catch { return []; }
+        }
+
+        // ── Phase 2a: Entity Resolution ───────────────────────────────────
+        console.log("\n=== Phase 2a: Entity Resolution ===\n");
+
+        const allEntities = db.exportAll().entities.filter(e => !e.rejected);
+        const allTriples = db.allTriples({ includeRejected: false });
+        let entitiesMerged = 0;
+        let entitiesFlagged = 0;
+
+        // Build word index: word → [entity names]
+        const wordIndex = new Map();
+        for (const e of allEntities) {
+          const words = e.name.split(/[\s'-]+/).filter(w => w.length > 1);
+          for (const word of words) {
+            if (!wordIndex.has(word)) wordIndex.set(word, []);
+            wordIndex.get(word).push(e.name);
+          }
+        }
+
+        // Find candidate clusters: entities sharing any word, size > 1
+        const visited = new Set();
+        const clusters = [];
+        for (const e of allEntities) {
+          if (visited.has(e.name)) continue;
+          const words = e.name.split(/[\s'-]+/).filter(w => w.length > 1);
+          const cluster = new Set();
+          cluster.add(e.name);
+          for (const word of words) {
+            // Skip very common words that would create giant clusters
+            const candidates = wordIndex.get(word) || [];
+            if (candidates.length > 15) continue;
+            for (const c of candidates) cluster.add(c);
+          }
+          if (cluster.size > 1) {
+            clusters.push([...cluster]);
+            for (const name of cluster) visited.add(name);
+          }
+        }
+
+        console.log(`Found ${clusters.length} entity clusters to review`);
+
+        for (let ci = 0; ci < clusters.length; ci++) {
+          const cluster = clusters[ci];
+          // Get all triples involving any entity in this cluster
+          const clusterTriples = allTriples.filter(t =>
+            cluster.includes(t.subject) || cluster.includes(t.object)
+          );
+
+          if (clusterTriples.length === 0) continue;
+
+          const prompt = `You are resolving entity ambiguity in a knowledge graph.
+
+Here is a cluster of entities that share common words and might be the same entity or different entities:
+
+Entities: ${JSON.stringify(cluster)}
+
+Triples involving these entities:
+${clusterTriples.map(t => `  ${t.subject} -[${t.predicate}]-> ${t.object}`).join("\n")}
+
+For each PAIR of entities that are THE SAME real-world thing (just different name forms), respond with:
+  {"action": "merge", "canonical": "<preferred full name>", "alias": "<shorter/alternate name>"}
+
+For entities that are DIFFERENT things despite sharing words, respond with:
+  {"action": "different", "entity1": "<name1>", "entity2": "<name2>"}
+
+If unsure, respond with:
+  {"action": "unsure", "entity1": "<name1>", "entity2": "<name2>"}
+
+Respond with ONLY a JSON array of decisions. If all entities in the cluster are clearly different, return [].`;
+
+          try {
+            console.log(`  [${ci + 1}/${clusters.length}] Cluster: ${cluster.join(", ")}`);
+            const decisions = await llmCall(prompt);
+
+            for (const d of decisions) {
+              if (d.action === "merge" && d.canonical && d.alias) {
+                if (opts.verbose) {
+                  console.log(`    [MERGE] "${d.alias}" → "${d.canonical}" (same_as)`);
+                }
+                if (!opts.dryRun) {
+                  db.softMerge(d.canonical, d.alias);
+                  // Record same_as relationship
+                  db.addTriple(d.alias, "same_as", d.canonical, { confidence: 1.0, source: "consolidation:llm" });
+                }
+                entitiesMerged++;
+              } else if (d.action === "unsure") {
+                if (opts.verbose) {
+                  console.log(`    [UNSURE] "${d.entity1}" vs "${d.entity2}" — flagged for interactive review`);
+                }
+                entitiesFlagged++;
+              }
+              // "different" — no action needed
+            }
+          } catch (err) {
+            console.error(`  Error resolving cluster ${cluster.join(", ")}: ${err}`);
+          }
+        }
+
+        console.log(`Entity resolution: ${entitiesMerged} merged, ${entitiesFlagged} flagged for review`);
+
+        // ── Phase 2b: Triple Review (grouped by entity) ───────────────────
+        console.log("\n=== Phase 2b: Triple Review ===\n");
+
+        // Re-fetch triples after entity resolution
         const remaining = db.allTriples({ includeRejected: false });
         const toReview = opts.entity
           ? remaining.filter(t =>
@@ -745,90 +873,109 @@ program
         if (toReview.length === 0) {
           console.log("No triples to review.");
         } else {
-          // Batch into chunks of 50
-          const BATCH = 50;
-          for (let i = 0; i < toReview.length; i += BATCH) {
-            const batch = toReview.slice(i, i + BATCH);
-            const prompt = `You are reviewing knowledge graph triples for accuracy and quality. For each triple below, respond with exactly one of:
-- "keep" — if the triple is correct and useful
-- "reject" — if it is incorrect, nonsensical, low-value, or garbage
-- "fix: <new-subject> | <new-predicate> | <new-object>" — if it's roughly correct but has errors
+          // Group triples by entity (each entity gets reviewed with all its relationships)
+          const entityTripleMap = new Map();
+          for (const t of toReview) {
+            if (!entityTripleMap.has(t.subject)) entityTripleMap.set(t.subject, []);
+            entityTripleMap.get(t.subject).push(t);
+            if (!entityTripleMap.has(t.object)) entityTripleMap.set(t.object, []);
+            entityTripleMap.get(t.object).push(t);
+          }
 
-Respond with a JSON array of objects: [{id: <id>, action: "keep"|"reject"|"fix", fix?: {subject, predicate, object}}]
+          // Process entities with most triples first, deduplicate reviewed triple IDs
+          const reviewedIds = new Set();
+          const sortedEntities = [...entityTripleMap.entries()]
+            .sort((a, b) => b[1].length - a[1].length);
 
-Triples to review:
-${JSON.stringify(batch.map(t => ({ id: t.id, subject: t.subject, predicate: t.predicate, object: t.object })), null, 2)}
+          // Batch entities into groups to avoid too many API calls
+          const BATCH_SIZE = 30; // triples per LLM call
+          let currentBatch = [];
+          let currentBatchTripleCount = 0;
 
-Respond with ONLY the JSON array, no other text.`;
+          async function flushTripleBatch() {
+            if (currentBatch.length === 0) return;
+
+            const batchTriples = [];
+            for (const { entity, triples } of currentBatch) {
+              for (const t of triples) {
+                if (!reviewedIds.has(t.id)) {
+                  batchTriples.push(t);
+                }
+              }
+            }
+            if (batchTriples.length === 0) return;
+
+            const entityNames = currentBatch.map(b => b.entity).join(", ");
+            const prompt = `You are reviewing knowledge graph triples grouped by entity for accuracy.
+
+For each triple, respond with:
+- "keep" — correct and useful
+- "reject" — incorrect, nonsensical, low-value, duplicate, or contradicts another triple
+- "fix" — roughly correct but needs correction (provide the corrected triple)
+
+When you see contradictions (e.g., "dating" and "married_to" for the same pair), keep the correct one and reject the other.
+When you see wrong directionality (parent marked as child), fix it.
+
+Entities being reviewed: ${entityNames}
+
+Triples:
+${JSON.stringify(batchTriples.map(t => ({ id: t.id, subject: t.subject, predicate: t.predicate, object: t.object })), null, 2)}
+
+Respond with ONLY a JSON array: [{id: <id>, action: "keep"|"reject"|"fix", fix?: {subject, predicate, object}, reason?: "brief explanation"}]`;
 
             try {
-              let responseText;
-
-              if (apiKey) {
-                // Cloud LLM (OpenAI-compatible)
-                const baseUrl = llmUrl.replace(/\/+$/, "");
-                const resp = await fetch(`${baseUrl}/chat/completions`, {
-                  method: "POST",
-                  headers: {
-                    "Content-Type": "application/json",
-                    "Authorization": `Bearer ${apiKey}`,
-                  },
-                  body: JSON.stringify({
-                    model: llmModel,
-                    messages: [{ role: "user", content: prompt }],
-                    temperature: 0,
-                  }),
-                });
-                const data = await resp.json();
-                responseText = data.choices?.[0]?.message?.content || "[]";
-              } else {
-                // Ollama
-                const resp = await fetch(`${llmUrl}/api/chat`, {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({
-                    model: llmModel,
-                    messages: [{ role: "user", content: prompt }],
-                    stream: false,
-                    options: { temperature: 0 },
-                  }),
-                });
-                const data = await resp.json();
-                responseText = data.message?.content || "[]";
-              }
-
-              // Parse response
-              const jsonMatch = responseText.match(/\[[\s\S]*\]/);
-              if (!jsonMatch) continue;
-
-              const decisions = JSON.parse(jsonMatch[0]);
-
+              const decisions = await llmCall(prompt);
               for (const d of decisions) {
+                reviewedIds.add(d.id);
                 if (d.action === "reject") {
                   if (!opts.dryRun) db.rejectTriple(d.id);
                   llmRejected++;
                   if (opts.verbose) {
-                    const t = batch.find(b => b.id === d.id);
-                    if (t) console.log(`  [LLM-REJECT] #${t.id}: ${t.subject} -[${t.predicate}]-> ${t.object}`);
+                    const t = batchTriples.find(b => b.id === d.id);
+                    if (t) console.log(`  [REJECT] #${t.id}: ${t.subject} -[${t.predicate}]-> ${t.object}${d.reason ? ` (${d.reason})` : ""}`);
                   }
                 } else if (d.action === "fix" && d.fix) {
                   if (!opts.dryRun) {
                     db.rejectTriple(d.id);
-                    db.addTriple(d.fix.subject, d.fix.predicate, d.fix.object);
+                    db.addTriple(d.fix.subject, d.fix.predicate, d.fix.object, {
+                      confidence: 0.9,
+                      source: "consolidation:llm-fix",
+                    });
                   }
                   llmFixed++;
                   if (opts.verbose) {
-                    const t = batch.find(b => b.id === d.id);
-                    if (t) console.log(`  [LLM-FIX]    #${t.id}: ${t.subject} -[${t.predicate}]-> ${t.object} => ${d.fix.subject} -[${d.fix.predicate}]-> ${d.fix.object}`);
+                    const t = batchTriples.find(b => b.id === d.id);
+                    if (t) console.log(`  [FIX]    #${t.id}: ${t.subject} -[${t.predicate}]-> ${t.object} → ${d.fix.subject} -[${d.fix.predicate}]-> ${d.fix.object}`);
                   }
                 }
               }
             } catch (err) {
-              console.error(`  LLM error on batch starting at ${i}: ${err}`);
+              console.error(`  LLM error reviewing ${entityNames}: ${err}`);
+            }
+
+            currentBatch = [];
+            currentBatchTripleCount = 0;
+          }
+
+          for (const [entity, triples] of sortedEntities) {
+            const unreviewedCount = triples.filter(t => !reviewedIds.has(t.id)).length;
+            if (unreviewedCount === 0) continue;
+
+            currentBatch.push({ entity, triples });
+            currentBatchTripleCount += unreviewedCount;
+
+            if (currentBatchTripleCount >= BATCH_SIZE) {
+              console.log(`  Reviewing: ${currentBatch.map(b => b.entity).join(", ")} (${currentBatchTripleCount} triples)`);
+              await flushTripleBatch();
             }
           }
-          console.log(`LLM-rejected: ${llmRejected} triples`);
-          console.log(`LLM-fixed:    ${llmFixed} triples`);
+          // Flush remaining
+          if (currentBatch.length > 0) {
+            console.log(`  Reviewing: ${currentBatch.map(b => b.entity).join(", ")} (${currentBatchTripleCount} triples)`);
+            await flushTripleBatch();
+          }
+
+          console.log(`\nLLM triple review: ${llmRejected} rejected, ${llmFixed} fixed`);
         }
       }
 
