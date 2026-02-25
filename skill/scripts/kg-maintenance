@@ -692,7 +692,7 @@ program
         }
 
         // Markdown artifacts — sentences masquerading as entities
-        const isSentenceLike = (s: string) =>
+        const isSentenceLike = (s) =>
           s.startsWith("**") || s.startsWith("- ") || s.startsWith("* ") ||
           s.includes("`") || s.includes("→") || s.includes("\n") ||
           /\. [A-Z]/.test(s);  // sentence break: period + space + capital letter
