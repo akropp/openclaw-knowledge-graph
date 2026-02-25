@@ -1,0 +1,278 @@
+#!/usr/bin/env node
+
+import { resolve } from "node:path";
+import { readFileSync, existsSync, mkdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { program } from "commander";
+import { GraphDB } from "../../../lib/graph-db.js";
+
+function getDbPath(opts) {
+  if (opts?.db) return resolve(opts.db);
+  if (process.env.KG_DB_PATH) return resolve(process.env.KG_DB_PATH);
+  const dir = resolve(homedir(), ".openclaw");
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  return resolve(dir, "knowledge-graph.db");
+}
+
+function openDb(opts) {
+  return new GraphDB(getDbPath(opts));
+}
+
+program
+  .name("kg")
+  .description("Knowledge graph CLI for OpenClaw")
+  .version("0.1.0")
+  .option("--db <path>", "Database file path");
+
+program
+  .command("add <subject> <predicate> <object>")
+  .description("Add a triple (subject -predicate-> object)")
+  .option("--type <type>", "Entity type for subject", "unknown")
+  .option("--confidence <n>", "Confidence score (0-1)", "1.0")
+  .option("--source <s>", "Source identifier")
+  .action((subject, predicate, object, opts) => {
+    const db = openDb(program.opts());
+    try {
+      db.addEntity(subject, opts.type);
+      db.addTriple(subject, predicate, object, {
+        confidence: parseFloat(opts.confidence),
+        source: opts.source,
+      });
+      console.log(`Added: ${subject} -[${predicate}]-> ${object}`);
+    } finally {
+      db.close();
+    }
+  });
+
+program
+  .command("prop <entity> <key> <value>")
+  .description("Set a property on an entity")
+  .option("--source <s>", "Source identifier")
+  .action((entity, key, value, opts) => {
+    const db = openDb(program.opts());
+    try {
+      db.addProperty(entity, key, value, { source: opts.source });
+      console.log(`Set ${entity}.${key} = ${value}`);
+    } finally {
+      db.close();
+    }
+  });
+
+program
+  .command("query <entity>")
+  .description("Multi-hop traversal from an entity")
+  .option("--hops <n>", "Number of hops", "2")
+  .option("--format <fmt>", "Output format: human|jsonl", "human")
+  .action((entity, opts) => {
+    const db = openDb(program.opts());
+    try {
+      const results = db.query(entity, parseInt(opts.hops));
+      if (opts.format === "jsonl") {
+        for (const r of results) {
+          console.log(JSON.stringify({ text: r.path, score: 1.0 / (r.depth + 1), source: "graph", meta: { depth: r.depth, entity_id: r.entity_id } }));
+        }
+      } else {
+        if (results.length === 0) {
+          console.log(`No results found for "${entity}"`);
+          return;
+        }
+        for (const r of results) {
+          const indent = "  ".repeat(r.depth);
+          console.log(`${indent}[depth ${r.depth}] ${r.path}`);
+        }
+      }
+    } finally {
+      db.close();
+    }
+  });
+
+program
+  .command("search <text>")
+  .description("Search entities by name")
+  .option("--format <fmt>", "Output format: human|jsonl", "human")
+  .action((text, opts) => {
+    const db = openDb(program.opts());
+    try {
+      const results = db.search(text);
+      if (opts.format === "jsonl") {
+        for (const r of results) {
+          console.log(JSON.stringify({ text: `${r.display_name} (${r.entity_type})`, score: 1.0, source: "graph", meta: { name: r.name } }));
+        }
+      } else {
+        if (results.length === 0) {
+          console.log(`No entities found matching "${text}"`);
+          return;
+        }
+        for (const r of results) {
+          console.log(`  ${r.display_name} [${r.entity_type}]`);
+        }
+      }
+    } finally {
+      db.close();
+    }
+  });
+
+program
+  .command("get <entity>")
+  .description("Get full entity details")
+  .option("--format <fmt>", "Output format: human|jsonl", "human")
+  .action((entity, opts) => {
+    const db = openDb(program.opts());
+    try {
+      const detail = db.getEntity(entity);
+      if (!detail) {
+        console.log(`Entity "${entity}" not found`);
+        process.exitCode = 1;
+        return;
+      }
+      if (opts.format === "jsonl") {
+        console.log(JSON.stringify(detail));
+      } else {
+        console.log(`${detail.entity.display_name} [${detail.entity.entity_type}]`);
+        if (detail.triples.length > 0) {
+          console.log("  Relationships:");
+          for (const t of detail.triples) {
+            if (t.direction === "outgoing") {
+              console.log(`    -[${t.predicate}]-> ${t.related_name} [${t.related_type}] (${t.confidence})`);
+            } else {
+              console.log(`    <-[${t.predicate}]- ${t.related_name} [${t.related_type}] (${t.confidence})`);
+            }
+          }
+        }
+        if (detail.properties.length > 0) {
+          console.log("  Properties:");
+          for (const p of detail.properties) {
+            console.log(`    ${p.key}: ${p.value}`);
+          }
+        }
+      }
+    } finally {
+      db.close();
+    }
+  });
+
+program
+  .command("merge <entity1> <entity2>")
+  .description("Merge two entities (keep first, absorb second)")
+  .action((entity1, entity2) => {
+    const db = openDb(program.opts());
+    try {
+      db.merge(entity1, entity2);
+      console.log(`Merged "${entity2}" into "${entity1}"`);
+    } finally {
+      db.close();
+    }
+  });
+
+program
+  .command("prune")
+  .description("Remove orphaned entities")
+  .option("--dry-run", "Show what would be pruned without deleting")
+  .action((opts) => {
+    const db = openDb(program.opts());
+    try {
+      const pruned = db.prune({ dryRun: opts.dryRun });
+      if (pruned.length === 0) {
+        console.log("No orphaned entities found.");
+      } else {
+        const verb = opts.dryRun ? "Would prune" : "Pruned";
+        console.log(`${verb} ${pruned.length} entities: ${pruned.join(", ")}`);
+      }
+    } finally {
+      db.close();
+    }
+  });
+
+program
+  .command("stats")
+  .description("Show graph statistics")
+  .action(() => {
+    const db = openDb(program.opts());
+    try {
+      const s = db.stats();
+      console.log(`Entities:   ${s.entity_count}`);
+      console.log(`Triples:    ${s.triple_count}`);
+      console.log(`Properties: ${s.property_count}`);
+      if (s.top_predicates.length > 0) {
+        console.log("Top predicates:");
+        for (const p of s.top_predicates) {
+          console.log(`  ${p.predicate}: ${p.count}`);
+        }
+      }
+    } finally {
+      db.close();
+    }
+  });
+
+program
+  .command("export")
+  .description("Export entire graph")
+  .option("--format <fmt>", "Output format: jsonl|dot", "jsonl")
+  .action((opts) => {
+    const db = openDb(program.opts());
+    try {
+      const data = db.exportAll();
+      if (opts.format === "dot") {
+        console.log("digraph knowledge_graph {");
+        console.log('  rankdir=LR;');
+        console.log('  node [shape=box, style=filled, fillcolor="#e8e8e8"];');
+        for (const e of data.entities) {
+          console.log(`  "${e.name}" [label="${e.display_name}\\n[${e.entity_type}]"];`);
+        }
+        for (const t of data.triples) {
+          console.log(`  "${t.subject_name}" -> "${t.object_name}" [label="${t.predicate}"];`);
+        }
+        console.log("}");
+      } else {
+        for (const t of data.triples) {
+          console.log(JSON.stringify({
+            subject: t.subject_name,
+            predicate: t.predicate,
+            object: t.object_name,
+            confidence: t.confidence,
+            source: t.source,
+          }));
+        }
+        for (const p of data.properties) {
+          console.log(JSON.stringify({
+            entity: p.entity_name,
+            key: p.key,
+            value: p.value,
+            source: p.source,
+          }));
+        }
+      }
+    } finally {
+      db.close();
+    }
+  });
+
+program
+  .command("import <file>")
+  .description("Import data from JSONL file")
+  .action((file) => {
+    const db = openDb(program.opts());
+    try {
+      const content = readFileSync(resolve(file), "utf-8");
+      const lines = content.split("\n").filter(Boolean);
+
+      const triples = [];
+      const properties = [];
+
+      for (const line of lines) {
+        const obj = JSON.parse(line);
+        if (obj.predicate) {
+          triples.push(obj);
+        } else if (obj.key) {
+          properties.push(obj);
+        }
+      }
+
+      db.importData({ triples, properties });
+      console.log(`Imported ${triples.length} triples, ${properties.length} properties`);
+    } finally {
+      db.close();
+    }
+  });
+
+program.parse();

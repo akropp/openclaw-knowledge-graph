@@ -1,0 +1,44 @@
+{
+  "id": "knowledge-graph",
+  "name": "Knowledge Graph",
+  "description": "Shared knowledge graph with entity extraction, multi-hop traversal, and RRF fusion",
+  "version": "0.1.0",
+  "skills": ["skills/knowledge-graph"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "dbPath": { "type": "string" },
+      "autoInject": { "type": "boolean" },
+      "maxHops": { "type": "integer", "minimum": 1, "maximum": 5 },
+      "maxContextTokens": { "type": "integer", "minimum": 100 },
+      "stability": {
+        "type": "object",
+        "properties": {
+          "loopThreshold": { "type": "integer", "minimum": 2 },
+          "confabulationCheck": { "type": "boolean" }
+        }
+      },
+      "fusion": {
+        "type": "object",
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "k": { "type": "integer" },
+          "sources": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": { "type": "string" },
+                "command": { "type": "string" },
+                "format": { "type": "string", "enum": ["jsonl", "lines"] },
+                "timeout": { "type": "integer" }
+              },
+              "required": ["id", "command"]
+            }
+          }
+        }
+      }
+    }
+  }
+}

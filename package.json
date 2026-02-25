@@ -1,0 +1,31 @@
+{
+  "name": "openclaw-knowledge-graph",
+  "version": "0.1.0",
+  "description": "Shared knowledge graph plugin for OpenClaw multi-agent systems",
+  "main": "index.ts",
+  "type": "module",
+  "bin": {
+    "kg": "./skills/knowledge-graph/scripts/kg"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "openclaw": {
+    "extensions": {
+      "plugin": "openclaw.plugin.json"
+    }
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.8.1",
+    "commander": "^13.1.0",
+    "compromise": "^14.14.3"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.5"
+  },
+  "license": "MIT"
+}
