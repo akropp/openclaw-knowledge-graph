@@ -697,9 +697,22 @@ export async function ingestSessions(
       stats.propertiesAdded += fileStats.propertiesAdded;
       stats.errors.push(...fileStats.errors);
 
-      // Mark file as processed in database
-      if (!opts.dryRun) {
+      // Only mark as processed if we actually extracted something OR had no errors
+      // Don't mark files where every chunk failed (e.g. rate limits, timeouts)
+      if (!opts.dryRun && fileStats.errors.length === 0) {
         markFileProcessed(graph, filePath);
+      } else if (!opts.dryRun && fileStats.errors.length > 0 && (fileStats.triplesAdded > 0 || fileStats.entitiesAdded > 0)) {
+        // Partial success — some chunks worked, some failed. Mark it so we don't redo the good parts,
+        // but log a warning
+        markFileProcessed(graph, filePath);
+        if (opts.verbose) {
+          console.log(`    ⚠ Partial success (${fileStats.errors.length} errors, but extracted ${fileStats.triplesAdded} triples)`);
+        }
+      } else if (fileStats.errors.length > 0) {
+        stats.filesSkipped = (stats.filesSkipped || 0) + 1;
+        if (opts.verbose) {
+          console.log(`    ✗ All chunks failed, will retry next run`);
+        }
       }
 
       if (opts.verbose) {
