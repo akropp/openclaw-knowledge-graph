@@ -58,7 +58,11 @@ export async function extractTriplesWithLLM(
       headers["Authorization"] = `Bearer ${opts.apiKey}`;
     }
 
-    const response = await fetch(`${ollamaUrl}/v1/chat/completions`, {
+    // Support both Ollama (http://host:port) and OpenAI-compatible APIs (http://host/v1)
+    const endpoint = ollamaUrl.endsWith("/v1") || ollamaUrl.includes("/v1/")
+      ? `${ollamaUrl.replace(/\/$/, "")}/chat/completions`
+      : `${ollamaUrl}/v1/chat/completions`;
+    const response = await fetch(endpoint, {
       method: "POST",
       headers,
       body: JSON.stringify({

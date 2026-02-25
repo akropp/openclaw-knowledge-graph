@@ -29,9 +29,10 @@ function openDb(opts) {
 function getLLMConfig() {
   const config = loadConfig();
   return {
-    enabled: config.llm?.enabled || false,
-    url: config.llm?.url || "http://mac-mini.tailcd0984.ts.net:11434",
-    model: config.llm?.model || "qwen2.5:14b"
+    enabled: !!(config.llm?.baseUrl || config.llm?.apiKey),
+    url: config.llm?.baseUrl || "http://localhost:11434",
+    model: config.llm?.model || "qwen2.5:14b",
+    apiKey: config.llm?.apiKey
   };
 }
 
