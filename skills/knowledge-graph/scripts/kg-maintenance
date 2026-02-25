@@ -230,4 +230,97 @@ program
     }
   });
 
+program
+  .command("ingest")
+  .alias("seed")
+  .description("Seed the knowledge graph from existing data sources")
+  .option("--source <type>", "Data source: markdown, factmem, or all (default: all)", "all")
+  .option(
+    "--paths <paths...>",
+    "Markdown paths to scan (default: shared and agent memory dirs)",
+    [
+      resolve(homedir(), "shared"),
+      resolve(homedir(), "clawd", "memory"),
+      resolve(homedir(), "gilfoyle", "memory"),
+      resolve(homedir(), "monty", "memory"),
+      resolve(homedir(), "sterling", "memory"),
+    ]
+  )
+  .option(
+    "--facts-db <path>",
+    "Path to facts.db (default: ~/shared/facts.db)",
+    resolve(homedir(), "shared", "facts.db")
+  )
+  .option("--dry-run", "Show what would be ingested without adding to graph")
+  .option("--verbose", "Show detailed progress")
+  .action(async (opts) => {
+    const { ingestMarkdown, ingestFactmem, ingestAll } = await import("../../../dist/lib/ingest.js");
+    const db = openDb(program.opts());
+
+    try {
+      console.log("╔═══════════════════════════════════════════════════════════════╗");
+      console.log("║       Knowledge Graph Ingestion                              ║");
+      console.log("╚═══════════════════════════════════════════════════════════════╝");
+      console.log();
+      console.log(`Date: ${new Date().toISOString()}`);
+      console.log(`Database: ${getDbPath(program.opts())}`);
+      console.log(`Source: ${opts.source}`);
+      if (opts.dryRun) {
+        console.log("Mode: DRY RUN (no changes will be made)");
+      }
+      console.log();
+
+      let stats;
+      const ingestOpts = { dryRun: opts.dryRun, verbose: opts.verbose };
+
+      switch (opts.source.toLowerCase()) {
+        case "markdown":
+        case "md":
+          stats = ingestMarkdown(db, opts.paths, ingestOpts);
+          break;
+        case "factmem":
+        case "facts":
+          stats = ingestFactmem(db, opts.factsDb, ingestOpts);
+          break;
+        case "all":
+        default:
+          stats = ingestAll(db, opts.paths, opts.factsDb, ingestOpts);
+          break;
+      }
+
+      console.log();
+      console.log("=== Ingestion Summary ===");
+      if (opts.source === "markdown" || opts.source === "all") {
+        console.log(`Markdown files processed: ${stats.filesProcessed}`);
+      }
+      if (opts.source === "factmem" || opts.source === "all") {
+        console.log(`Facts processed: ${stats.factsProcessed}`);
+      }
+      console.log(`Entities added: ${stats.entitiesAdded}`);
+      console.log(`Triples added: ${stats.triplesAdded}`);
+      console.log(`Properties added: ${stats.propertiesAdded}`);
+
+      if (stats.errors.length > 0) {
+        console.log();
+        console.log(`⚠️  Encountered ${stats.errors.length} errors:`);
+        for (const error of stats.errors.slice(0, 10)) {
+          console.log(`  - ${error}`);
+        }
+        if (stats.errors.length > 10) {
+          console.log(`  ... and ${stats.errors.length - 10} more`);
+        }
+      } else {
+        console.log();
+        console.log("✓ Ingestion completed successfully!");
+      }
+
+      if (opts.dryRun) {
+        console.log();
+        console.log("ℹ️  This was a dry run. Run without --dry-run to apply changes.");
+      }
+    } finally {
+      db.close();
+    }
+  });
+
 program.parse();
