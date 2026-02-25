@@ -26,6 +26,15 @@ function openDb(opts) {
   return new GraphDB(getDbPath(opts));
 }
 
+function getLLMConfig() {
+  const config = loadConfig();
+  return {
+    enabled: config.llm?.enabled || false,
+    url: config.llm?.url || "http://mac-mini.tailcd0984.ts.net:11434",
+    model: config.llm?.model || "qwen2.5:14b"
+  };
+}
+
 // Simple Levenshtein distance for fuzzy matching
 function levenshtein(a, b) {
   const matrix = [];
@@ -290,22 +299,17 @@ program
       let model;
 
       if (opts.llm !== undefined) {
-        // --llm flag was passed
+        // --llm flag was passed (opt-in)
         useLLM = true;
-        // If --llm has a value, use it; otherwise use config or error
         if (typeof opts.llm === "string") {
+          // URL provided as argument
           ollamaUrl = opts.llm;
-        } else if (llmConfig) {
-          ollamaUrl = llmConfig.baseUrl;
         } else {
-          console.error("Error: --llm requires a URL argument or LLM configuration in ~/.openclaw/kg.json");
-          process.exit(1);
+          // No URL provided, try config then default
+          ollamaUrl = llmConfig.url || "http://mac-mini.tailcd0984.ts.net:11434";
         }
-      } else if (llmConfig) {
-        // Config has LLM settings, enable by default
-        useLLM = true;
-        ollamaUrl = llmConfig.baseUrl;
       }
+      // If --llm not passed, useLLM stays false (NLP is default)
 
       if (useLLM) {
         // Determine model: CLI flag > config > error
@@ -407,21 +411,17 @@ program
     let model;
 
     if (opts.llm !== undefined) {
-      // --llm flag was passed
+      // --llm flag was passed (opt-in)
       useLLM = true;
       if (typeof opts.llm === "string") {
+        // URL provided as argument
         ollamaUrl = opts.llm;
-      } else if (llmConfig) {
-        ollamaUrl = llmConfig.baseUrl;
       } else {
-        console.error("Error: --llm requires a URL argument or LLM configuration in ~/.openclaw/kg.json");
-        process.exit(1);
+        // No URL provided, try config then default
+        ollamaUrl = llmConfig.url || "http://mac-mini.tailcd0984.ts.net:11434";
       }
-    } else if (llmConfig) {
-      // Config has LLM settings, enable by default
-      useLLM = true;
-      ollamaUrl = llmConfig.baseUrl;
     }
+    // If --llm not passed, useLLM stays false (NLP is default)
 
     if (useLLM) {
       // Determine model: CLI flag > config > fallback
