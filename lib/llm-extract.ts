@@ -1,5 +1,43 @@
 import { preprocessText } from "./entity-extract.js";
 
+/** Parse LLM response content into triples */
+function parseTriples(content: string): LLMTriple[] {
+  const triples: LLMTriple[] = [];
+
+  // Strategy 1: Find JSON objects with regex (handles multi-line)
+  const jsonRegex = /\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}/g;
+  const matches = content.match(jsonRegex) || [];
+
+  for (const match of matches) {
+    try {
+      const triple = JSON.parse(match) as LLMTriple;
+      if (triple.subject && triple.predicate && triple.object) {
+        triples.push(triple);
+      }
+    } catch {
+      // Not valid JSON, skip
+    }
+  }
+
+  // Strategy 2: If regex found nothing, try parsing as JSON array
+  if (triples.length === 0) {
+    try {
+      const arr = JSON.parse(content);
+      if (Array.isArray(arr)) {
+        for (const item of arr) {
+          if (item.subject && item.predicate && item.object) {
+            triples.push(item as LLMTriple);
+          }
+        }
+      }
+    } catch {
+      // Not a JSON array either
+    }
+  }
+
+  return triples;
+}
+
 export interface LLMTriple {
   subject: string;
   predicate: string;
@@ -76,8 +114,41 @@ export async function extractTriplesWithLLM(
       signal: AbortSignal.timeout(120000), // 120s timeout (model loading + inference)
     });
 
+    // Retry on 429 with exponential backoff
+    if (response.status === 429) {
+      const retryAfter = parseInt(response.headers.get("retry-after") || "0", 10);
+      const waitMs = retryAfter ? retryAfter * 1000 : 5000;
+      if (opts.verbose) {
+        console.log(`  ⏳ Rate limited, waiting ${waitMs / 1000}s...`);
+      }
+      await new Promise((r) => setTimeout(r, waitMs));
+      // Retry once
+      const retry = await fetch(endpoint, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: "system", content: SYSTEM_PROMPT },
+            { role: "user", content: cleanedText },
+          ],
+          temperature: 0,
+        }),
+        signal: AbortSignal.timeout(120000),
+      });
+      if (!retry.ok) {
+        throw new Error(`LLM API error after retry: ${retry.status} ${retry.statusText}`);
+      }
+      const retryData = (await retry.json()) as any;
+      const retryContent = retryData.choices?.[0]?.message?.content;
+      if (retryContent) {
+        return parseTriples(retryContent);
+      }
+      return [];
+    }
+
     if (!response.ok) {
-      throw new Error(`Ollama API error: ${response.status} ${response.statusText}`);
+      throw new Error(`LLM API error: ${response.status} ${response.statusText}`);
     }
 
     const data = (await response.json()) as any;
@@ -90,41 +161,7 @@ export async function extractTriplesWithLLM(
       return [];
     }
 
-    // Parse response — handle both single-line JSONL and multi-line JSON
-    const triples: LLMTriple[] = [];
-
-    // Strategy 1: Try to find JSON objects with regex (handles multi-line)
-    const jsonRegex = /\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}/g;
-    const matches = content.match(jsonRegex) || [];
-
-    for (const match of matches) {
-      try {
-        const triple = JSON.parse(match) as LLMTriple;
-        if (triple.subject && triple.predicate && triple.object) {
-          triples.push(triple);
-        }
-      } catch {
-        // Not valid JSON, skip
-      }
-    }
-
-    // Strategy 2: If regex found nothing, try parsing the whole response as a JSON array
-    if (triples.length === 0) {
-      try {
-        const arr = JSON.parse(content);
-        if (Array.isArray(arr)) {
-          for (const item of arr) {
-            if (item.subject && item.predicate && item.object) {
-              triples.push(item as LLMTriple);
-            }
-          }
-        }
-      } catch {
-        // Not a JSON array either
-      }
-    }
-
-    return triples;
+    return parseTriples(content);
   } catch (err: any) {
     if (opts.verbose) {
       console.warn(`  ⚠ LLM extraction failed: ${err.message}`);
