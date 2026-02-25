@@ -650,14 +650,24 @@ program
       console.log("=== Phase 1: Auto-cleanup ===\n");
 
       // Reject garbage entities FIRST (before clustering or triple review)
-      const isSentenceLikeEntity = (s) =>
-        s.startsWith("**") || s.startsWith("- ") || s.startsWith("* ") ||
-        s.includes("`") || s.includes("→") || s.includes("\n") ||
-        s.includes(" — ") || s.includes(" — ") ||  // em-dash separators
-        s.includes(", ") ||                           // comma-separated lists
-        /\. [A-Z]/.test(s) ||
-        s.split(/\s+/).length > 6 ||
-        s.length > 60;
+      const isSentenceLikeEntity = (s) => {
+        if (!s) return false;
+        // Phone numbers are valid: +19147721291, 914-555-1234
+        if (/^\+?[\d\s\-().]{7,20}$/.test(s)) return false;
+        return (
+          s.startsWith("**") || s.startsWith("- ") || s.startsWith("* ") ||
+          s.includes("`") || s.includes("→") || s.includes("\n") ||
+          s.includes(" — ") ||                              // em-dash separators
+          s.includes(", ") ||                               // comma-separated lists
+          s.includes(" + ") ||                              // concatenated items
+          /\([^)]*\s+[^)]+\)/.test(s) ||                   // parenthetical with multiple words (description, not nickname)
+          (s.includes(":") && !s.match(/^\+?[\d\s\-().]+$/)) || // colon (not in phone)
+          /\. [A-Z]/.test(s) ||                             // sentence break
+          (/[0-9]{5,}/.test(s) && !/^\+?[\d\s\-().]+$/.test(s)) || // long digits (not phone)
+          s.split(/\s+/).length > 5 ||
+          s.length > 50
+        );
+      };
 
       const allEntities = db.exportAll().entities.filter(e => !e.rejected);
       let autoRejectedEntityCount = 0;
@@ -716,28 +726,9 @@ program
           continue;
         }
 
-        // Markdown artifacts — sentences masquerading as entities
-        const isSentenceLike = (s) =>
-          s.startsWith("**") || s.startsWith("- ") || s.startsWith("* ") ||
-          s.includes("`") || s.includes("→") || s.includes("\n") ||
-          /\. [A-Z]/.test(s);  // sentence break: period + space + capital letter
-
-        if (isSentenceLike(triple.subject) || isSentenceLike(triple.object)) {
+        if (isSentenceLikeEntity(triple.subject) || isSentenceLikeEntity(triple.object)) {
           if (opts.verbose) {
             console.log(`  [SENTENCE]    #${triple.id}: ${triple.subject.substring(0, 60)} -[${triple.predicate}]-> ${triple.object.substring(0, 60)}`);
-          }
-          if (!opts.dryRun) db.rejectTriple(triple.id);
-          autoRejectedTriples++;
-          continue;
-        }
-
-        // Reject if subject or object looks like a sentence (too long or too many words)
-        const subjectWordCount = triple.subject.split(/\s+/).length;
-        const objectWordCount = triple.object.split(/\s+/).length;
-        if (triple.object.length > 60 || triple.subject.length > 60 ||
-            subjectWordCount > 6 || objectWordCount > 6) {
-          if (opts.verbose) {
-            console.log(`  [TOO-LONG]    #${triple.id}: ${triple.subject.substring(0, 60)}...`);
           }
           if (!opts.dryRun) db.rejectTriple(triple.id);
           autoRejectedTriples++;
