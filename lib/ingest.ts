@@ -98,6 +98,7 @@ function extractTextFromContent(content: any): string {
 }
 
 // Process a single session file (line by line to handle large files)
+// Collects entities in memory, then batch-writes them in one transaction.
 async function processSessionFile(
   graph: GraphDB,
   filePath: string,
@@ -108,8 +109,9 @@ async function processSessionFile(
     entitiesAdded: 0, 
     errors: [] 
   };
+  const pendingEntities: Array<{ name: string; type: string }> = [];
 
-  return new Promise((resolve) => {
+  await new Promise<void>((resolve) => {
     const fileStream = createReadStream(filePath, { encoding: "utf-8" });
     const rl = createInterface({ input: fileStream, crlfDelay: Infinity });
 
@@ -130,9 +132,7 @@ async function processSessionFile(
             // Extract entities from the message text
             const entities = extractEntities(text, graph);
             for (const entity of entities) {
-              if (!opts.dryRun) {
-                graph.addEntity(entity.name, entity.type);
-              }
+              pendingEntities.push(entity);
               stats.entitiesAdded++;
             }
 
@@ -149,15 +149,23 @@ async function processSessionFile(
       }
     });
 
-    rl.on("close", () => {
-      resolve(stats);
-    });
-
+    rl.on("close", () => resolve());
     rl.on("error", (err) => {
       stats.errors.push(`Error reading ${filePath}: ${err}`);
-      resolve(stats);
+      resolve();
     });
   });
+
+  // Batch-write all entities from this file in one transaction
+  if (!opts.dryRun && pendingEntities.length > 0) {
+    graph.batch(() => {
+      for (const entity of pendingEntities) {
+        graph.addEntity(entity.name, entity.type);
+      }
+    });
+  }
+
+  return stats;
 }
 
 export async function ingestSessions(
@@ -393,6 +401,8 @@ export function ingestMarkdown(
     console.log(`Found ${mdFiles.length} markdown files to process`);
   }
 
+  // Batch all markdown writes in a single transaction
+  graph.batch(() => {
   for (let i = 0; i < mdFiles.length; i++) {
     const filePath = mdFiles[i];
     try {
@@ -467,6 +477,7 @@ export function ingestMarkdown(
       }
     }
   }
+  }); // end batch
 
   return stats;
 }
@@ -502,6 +513,7 @@ export function ingestFactmem(
 
     console.log(`  Found ${facts.length} facts to process`);
 
+    graph.batch(() => {
     for (const fact of facts) {
       try {
         stats.factsProcessed++;
@@ -568,6 +580,7 @@ export function ingestFactmem(
         }
       }
     }
+    }); // end batch
 
     factsDb.close();
   } catch (err) {

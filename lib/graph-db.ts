@@ -146,6 +146,11 @@ export class GraphDB {
     this.db.exec(FTS_TRIGGERS);
   }
 
+  /** Run a callback inside a single transaction (batches all writes). */
+  batch<T>(fn: () => T): T {
+    return this.db.transaction(fn)();
+  }
+
   addEntity(name: string, type?: string): number {
     const canonical = name.toLowerCase().trim();
     const displayName = name.trim();
