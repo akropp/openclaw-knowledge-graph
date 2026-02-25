@@ -1,5 +1,5 @@
 {
-  "name": "openclaw-knowledge-graph",
+  "name": "knowledge-graph",
   "version": "0.1.0",
   "description": "Shared knowledge graph plugin for OpenClaw multi-agent systems",
   "main": "index.ts",
