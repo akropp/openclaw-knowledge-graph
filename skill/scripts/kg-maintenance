@@ -731,9 +731,9 @@ program
             const n2 = e2.name;
             if (processed.has(n2)) continue;
 
-            // Check if names are variants of the same entity (e.g., "adam" vs "adam kropp")
-            // Must share the same word tokens — not just substring match
-            if (n1 !== n2) {
+            // Auto-merge only person name variants (e.g., "adam" vs "adam kropp")
+            // Non-person entities like "calendar" vs "noah's calendar" are different things
+            if (n1 !== n2 && e1.type === "person" && e2.type === "person") {
               const words1 = new Set(n1.split(/[\s'-]+/).filter(w => w.length > 1));
               const words2 = new Set(n2.split(/[\s'-]+/).filter(w => w.length > 1));
               const shorter = n1.length <= n2.length ? n1 : n2;
@@ -742,10 +742,7 @@ program
               const longerWords = n1.length <= n2.length ? words2 : words1;
 
               // Every word in the shorter name must appear in the longer name
-              // e.g., "adam" → ["adam"], "adam kropp" → ["adam", "kropp"] — "adam" ⊂ "adam kropp" ✓
-              // e.g., "calendar" → ["calendar"], "noah's calendar" → ["noah", "calendar"] — "calendar" ⊄ not a name variant
               const allShorterWordsInLonger = [...shorterWords].every(w => longerWords.has(w));
-              // The longer name should only add 1-2 words (not a totally different entity)
               const addedWords = longerWords.size - shorterWords.size;
 
               if (allShorterWordsInLonger && addedWords <= 2 && addedWords >= 1 && shorterWords.size >= 1) {
