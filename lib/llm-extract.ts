@@ -78,25 +78,37 @@ export async function extractTriplesWithLLM(
       return [];
     }
 
-    // Parse JSONL response
+    // Parse response — handle both single-line JSONL and multi-line JSON
     const triples: LLMTriple[] = [];
-    const lines = content.split("\n");
 
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed || !trimmed.startsWith("{")) continue;
+    // Strategy 1: Try to find JSON objects with regex (handles multi-line)
+    const jsonRegex = /\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}/g;
+    const matches = content.match(jsonRegex) || [];
 
+    for (const match of matches) {
       try {
-        const triple = JSON.parse(trimmed) as LLMTriple;
-        
-        // Validate triple has required fields
+        const triple = JSON.parse(match) as LLMTriple;
         if (triple.subject && triple.predicate && triple.object) {
           triples.push(triple);
         }
-      } catch (err) {
-        if (opts.verbose) {
-          console.warn(`  ⚠ Failed to parse LLM output line: ${trimmed}`);
+      } catch {
+        // Not valid JSON, skip
+      }
+    }
+
+    // Strategy 2: If regex found nothing, try parsing the whole response as a JSON array
+    if (triples.length === 0) {
+      try {
+        const arr = JSON.parse(content);
+        if (Array.isArray(arr)) {
+          for (const item of arr) {
+            if (item.subject && item.predicate && item.object) {
+              triples.push(item as LLMTriple);
+            }
+          }
         }
+      } catch {
+        // Not a JSON array either
       }
     }
 
