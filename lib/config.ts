@@ -41,6 +41,7 @@ export function loadConfig(): KGConfig {
         baseUrl: parsed.llm.baseUrl,
         model: parsed.llm.model,
         apiKey: parsed.llm.apiKey,
+        chunkSize: parsed.llm.chunkSize,
       } : undefined,
     };
   } catch (err) {
