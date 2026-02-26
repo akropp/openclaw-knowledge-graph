@@ -183,10 +183,23 @@ function formatKGContext(entityNames: string[], graph: GraphDB): string | null {
 
       const parts: string[] = [];
 
-      // Outgoing/incoming relationships (skip pure property predicates)
-      for (const t of detail.triples) {
-        if (parts.length >= 6) break; // cap at 6 facts per entity
+      // Outgoing relationships only — incoming render backwards and confuse context
+      const outgoing = detail.triples.filter((t: any) => t.direction === "outgoing");
+      const incoming = detail.triples.filter((t: any) => t.direction === "incoming");
+      for (const t of outgoing) {
+        if (parts.length >= 6) break;
         parts.push(`${t.predicate} ${t.related_name}`);
+      }
+      // For incoming: flip to a readable form (e.g. "parent_of Nico Brunetti")
+      const flipPredicate: Record<string, string> = {
+        child_of: "parent_of", parent_of: "child_of",
+        married_to: "married_to", same_as: "same_as",
+        works_with: "works_with", collaborates_with: "collaborates_with",
+      };
+      for (const t of incoming) {
+        if (parts.length >= 8) break;
+        const flipped = flipPredicate[t.predicate];
+        if (flipped) parts.push(`${flipped} ${t.related_name}`);
       }
 
       // A few properties (phone, email, age, etc.)
