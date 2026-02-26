@@ -160,14 +160,26 @@ async function processSessionFile(
 }
 
 // Format KG query results as a concise context block for injection into the prompt.
-// Uses graph.getEntity() for clean direct-relationship output.
+// Uses graph.getEntity() for clean direct-relationship output, with FTS fallback.
 function formatKGContext(entityNames: string[], graph: GraphDB): string | null {
   const lines: string[] = [];
+  const seen = new Set<string>();
 
   for (const name of entityNames) {
     try {
-      const detail = graph.getEntity(name);
+      // Try exact lookup first; fall back to FTS search for partial names
+      let detail = graph.getEntity(name);
+      if (!detail) {
+        const hits = graph.search(name);
+        if (hits.length > 0) {
+          detail = graph.getEntity(hits[0].name);
+        }
+      }
       if (!detail) continue;
+
+      const canonicalName = detail.entity.display_name;
+      if (seen.has(canonicalName)) continue;
+      seen.add(canonicalName);
 
       const parts: string[] = [];
 
@@ -183,7 +195,7 @@ function formatKGContext(entityNames: string[], graph: GraphDB): string | null {
       }
 
       if (parts.length > 0) {
-        lines.push(`${detail.entity.display_name}: ${parts.join(", ")}`);
+        lines.push(`${canonicalName}: ${parts.join(", ")}`);
       }
     } catch {
       // Ignore per-entity errors
@@ -367,13 +379,24 @@ export default function register(api: any): void {
 
       // Extract entity names from the prompt (NLP, fast)
       const entities = extractEntities(prompt, graph);
-      if (entities.length === 0) return undefined;
 
       // Collect unique entity names sorted by confidence
       const entityNames = entities
         .sort((a, b) => b.confidence - a.confidence)
         .slice(0, 8) // cap at 8 entities to keep context tight
         .map((e) => e.name);
+
+      // FTS fallback: also search for capitalized words/phrases from the prompt
+      // This catches names like "Brandon" that NLP misses in short questions
+      const capitalizedTokens = (prompt.match(/\b[A-Z][a-z]{2,}\b/g) || [])
+        .filter((w) => !["Who", "What", "Where", "When", "How", "Why", "Is", "Are", "Can", "Did", "Does", "The", "And"].includes(w));
+      for (const token of capitalizedTokens) {
+        if (!entityNames.includes(token.toLowerCase())) {
+          entityNames.push(token.toLowerCase());
+        }
+      }
+
+      if (entityNames.length === 0) return undefined;
 
       const context = formatKGContext(entityNames, graph);
       if (!context) return undefined;
