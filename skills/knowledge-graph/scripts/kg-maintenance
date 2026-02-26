@@ -4,9 +4,9 @@ import { resolve, dirname } from "node:path";
 import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { program } from "commander";
-import { GraphDB } from "../../dist/lib/graph-db.js";
-import { loadConfig } from "../../dist/lib/config.js";
-import { isGarbageEntityName } from "../../dist/lib/entity-extract.js";
+import { GraphDB } from "../../../dist/lib/graph-db.js";
+import { loadConfig } from "../../../dist/lib/config.js";
+import { isGarbageEntityName } from "../../../dist/lib/entity-extract.js";
 
 function getDbPath(opts) {
   if (opts?.db) return resolve(opts.db);
@@ -280,7 +280,7 @@ program
   .option("--dry-run", "Show what would be ingested without adding to graph")
   .option("--verbose", "Show detailed progress")
   .action(async (opts) => {
-    const { ingestSessions, ingestMarkdown, ingestFactmem, ingestAll } = await import("../../dist/lib/ingest.js");
+    const { ingestSessions, ingestMarkdown, ingestFactmem, ingestAll } = await import("../../../dist/lib/ingest.js");
     const db = openDb(program.opts());
     const config = loadConfig();
     const llmConfig = getLLMConfig();
@@ -451,7 +451,7 @@ program
 
     if (isSession && useLLM) {
       // LLM-based extraction for sessions
-      const { extractTriplesWithLLM, chunkMessages } = await import("../../dist/lib/llm-extract.js");
+      const { extractTriplesWithLLM, chunkMessages } = await import("../../../dist/lib/llm-extract.js");
       
       console.log(`\n🤖 Using LLM extraction (${model})`);
       console.log(`File: ${file}\n`);
@@ -521,7 +521,7 @@ program
 
     } else if (isSession) {
       // NLP-based extraction for sessions
-      const { extractEntities } = await import("../../dist/lib/entity-extract.js");
+      const { extractEntities } = await import("../../../dist/lib/entity-extract.js");
       
       const rl = createInterface({ input: createReadStream(file, "utf-8"), crlfDelay: Infinity });
       let msgCount = 0;
@@ -588,7 +588,7 @@ program
 
     } else {
       // Process as markdown (always NLP-based)
-      const { extractEntities } = await import("../../dist/lib/entity-extract.js");
+      const { extractEntities } = await import("../../../dist/lib/entity-extract.js");
       const content = readFileSync(file, "utf-8");
       const entities = extractEntities(content);
 
