@@ -3,7 +3,7 @@
   "name": "Knowledge Graph",
   "description": "Shared knowledge graph with entity extraction, multi-hop traversal, and RRF fusion. Configure via ~/.openclaw/kg.json or use 'kg init'",
   "version": "0.1.0",
-  "skills": ["skills/knowledge-graph"],
+  "skills": ["skill"],
   "configSchema": {
     "type": "object",
     "properties": {},
