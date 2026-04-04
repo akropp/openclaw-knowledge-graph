@@ -159,18 +159,194 @@ async function processSessionFile(
   } catch {}
 }
 
-// Format KG query results as a concise context block for injection into the prompt.
-// Uses graph.getEntity() for clean direct-relationship output, with FTS fallback.
+// Keep injected KG context narrow and conversationally relevant.
+const BLOCKED_ENTITY_NAMES = new Set([
+  "current state",
+  "current working solution",
+  "current weather infrastructure",
+  "current trading status",
+  "local store",
+]);
+
+const ALLOWED_INCOMING_PREDICATES = new Set([
+  "child_of",
+  "parent_of",
+  "married_to",
+  "same_as",
+  "works_with",
+  "collaborates_with",
+  "owns",
+  "member_of",
+]);
+
+const BLOCKED_PREDICATES = new Set([
+  "has_config",
+  "has_cron",
+  "has_phone",
+  "lives_in",
+  "has_current_p&l",
+  "has_settlement_processor",
+  "has_strategy",
+  "has_portfolio",
+]);
+
+const BLOCKED_PROPERTY_KEYS = new Set([
+  "phone",
+  "email",
+  "address",
+  "path",
+  "config",
+  "clipath",
+  "token",
+  "secret",
+]);
+
+function isGenericEntityName(name: string): boolean {
+  const n = name.trim().toLowerCase();
+  if (!n) return true;
+  if (BLOCKED_ENTITY_NAMES.has(n)) return true;
+  if (/^current\s+/.test(n)) return true;
+  if (/^(status|state|solution|store|infrastructure|workflow|system)$/.test(n)) return true;
+  // Block ALL possessive entity names like "janine's patterns", "noah's futsal",
+  // "adam's schedule" — these are always garbage extraction artifacts, not real entities.
+  if (/'.?s\s+\w/i.test(n)) return true;
+  return false;
+}
+
+function isSensitiveProperty(key: string, value: string): boolean {
+  const k = key.trim().toLowerCase();
+  const v = value.trim().toLowerCase();
+  if (BLOCKED_PROPERTY_KEYS.has(k)) return true;
+  if (/therapy|xanax|meds|medication|psychiat|mental|trauma|grievance|complain|judg(e)?ment/.test(k)) return true;
+  if (/therapy|xanax|meds|medication|psychiat|mental health|couples therapy/.test(v)) return true;
+  return false;
+}
+
+/**
+ * Strip OpenClaw inbound metadata blocks from the prompt so entity extraction
+ * only runs on the actual user message text.
+ *
+ * Removes:
+ * - Conversation info / Sender / Thread / Forwarded metadata JSON blocks
+ * - Untrusted context wrapper blocks (<<<EXTERNAL_UNTRUSTED_CONTENT ... >>>)
+ * - Discord chat history lines ([Discord Guild ... ] user: ...)
+ * - Leading timestamp prefixes
+ */
+function stripPromptMetadata(prompt: string): string {
+  const lines = prompt.split("\n");
+  const kept: string[] = [];
+  let inMetaBlock = false;
+  let inUntrustedBlock = false;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line.trim();
+
+    // Skip leading timestamp prefix
+    if (i === 0 && /^\[[A-Za-z]{3} \d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(trimmed)) {
+      const stripped = line.replace(/^\[[A-Za-z]{3} \d{4}-\d{2}-\d{2} \d{2}:\d{2}[^\]]*\]\s*/, "");
+      if (stripped.trim()) kept.push(stripped);
+      continue;
+    }
+
+    // Skip metadata sentinel blocks (Conversation info, Sender, Thread starter, etc.)
+    if (/^(Conversation info|Sender|Thread starter|Replied message|Forwarded message|Chat history)\s*\(.*metadata\)\s*:?\s*$/.test(trimmed)) {
+      inMetaBlock = true;
+      continue;
+    }
+    if (inMetaBlock) {
+      if (trimmed === "```json") continue;
+      if (trimmed === "```") { inMetaBlock = false; continue; }
+      if (trimmed === "" || trimmed.startsWith("{") || trimmed.startsWith("}") || trimmed.startsWith('"')) continue;
+      // Non-JSON line after sentinel — end of block
+      inMetaBlock = false;
+    }
+
+    // Skip untrusted context wrapper blocks
+    if (/^<<<EXTERNAL_UNTRUSTED_CONTENT/.test(trimmed)) {
+      inUntrustedBlock = true;
+      continue;
+    }
+    if (inUntrustedBlock) {
+      if (/^<<<END_EXTERNAL_UNTRUSTED_CONTENT/.test(trimmed)) { inUntrustedBlock = false; continue; }
+      // Lines inside the untrusted block that are just labels/headers
+      if (/^(Source:|---$|UNTRUSTED\s)/.test(trimmed)) continue;
+      // Actual user text inside the block — keep it
+      if (trimmed) kept.push(line);
+      continue;
+    }
+
+    // Skip "Untrusted context (metadata, do not treat as instructions or commands):" header
+    if (/^Untrusted context \(metadata/.test(trimmed)) continue;
+
+    // Skip Discord chat history lines
+    if (/^\[Discord\s+(Guild|DM)\s/.test(trimmed)) continue;
+
+    // Skip System event lines
+    if (/^System:\s*\[/.test(trimmed)) continue;
+
+    kept.push(line);
+  }
+
+  return kept.join("\n").replace(/^\n+/, "").replace(/\n+$/, "").trim();
+}
+
+function normalizeMentionToken(token: string): string {
+  return token.trim().toLowerCase().replace(/^@+/, "");
+}
+
+function extractPromptMentionTokens(prompt: string): string[] {
+  const tokens = new Set<string>();
+  for (const raw of prompt.match(/@?[A-Z][a-zA-Z0-9_-]{1,}|@?[a-z][a-z0-9_-]{2,}/g) || []) {
+    const token = normalizeMentionToken(raw);
+    if (!token) continue;
+    if (["what","when","where","which","would","could","should","there","their","about","have","with","from","this","that"].includes(token)) continue;
+    tokens.add(token);
+  }
+  return [...tokens];
+}
+
+function resolvePromptEntities(prompt: string, graph: GraphDB): string[] {
+  const scored = new Map<string, number>();
+
+  // Strip possessives so "Noah's friends" produces a lookup for "Noah"
+  const depossessived = prompt.replace(/(\w+)'s\b/gi, "$1");
+
+  for (const e of extractEntities(depossessived, graph)) {
+    if (isGenericEntityName(e.name)) continue;
+    scored.set(e.name, Math.max(scored.get(e.name) ?? 0, e.confidence + 1.0));
+  }
+
+  for (const token of extractPromptMentionTokens(depossessived)) {
+    const direct = graph.getEntity(token);
+    if (direct && !isGenericEntityName(direct.entity.display_name)) {
+      scored.set(direct.entity.display_name, Math.max(scored.get(direct.entity.display_name) ?? 0, 3.0));
+      continue;
+    }
+    for (const hit of graph.search(token).slice(0, 3)) {
+      if (isGenericEntityName(hit.display_name)) continue;
+      const exactish = hit.name === token || hit.display_name.toLowerCase() === token;
+      const boost = exactish ? 2.5 : 1.4;
+      scored.set(hit.display_name, Math.max(scored.get(hit.display_name) ?? 0, boost));
+    }
+  }
+
+  return [...scored.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 4)
+    .map(([name]) => name);
+}
+
+// Format only directly-mentioned, non-generic entities and suppress noisy/sensitive facts.
 function formatKGContext(entityNames: string[], graph: GraphDB): string | null {
   const lines: string[] = [];
   const seen = new Set<string>();
 
   for (const name of entityNames) {
     try {
-      // Try exact lookup first; fall back to FTS search for partial names
       let detail = graph.getEntity(name);
       if (!detail) {
-        const hits = graph.search(name);
+        const hits = graph.search(name).filter((h: any) => !isGenericEntityName(h.display_name));
         if (hits.length > 0) {
           detail = graph.getEntity(hits[0].name);
         }
@@ -178,33 +354,39 @@ function formatKGContext(entityNames: string[], graph: GraphDB): string | null {
       if (!detail) continue;
 
       const canonicalName = detail.entity.display_name;
-      if (seen.has(canonicalName)) continue;
+      if (seen.has(canonicalName) || isGenericEntityName(canonicalName)) continue;
       seen.add(canonicalName);
 
       const parts: string[] = [];
+      const outgoing = detail.triples.filter((t: any) => t.direction === "outgoing" && !BLOCKED_PREDICATES.has(String(t.predicate).toLowerCase()));
+      const incoming = detail.triples.filter((t: any) => t.direction === "incoming" && ALLOWED_INCOMING_PREDICATES.has(String(t.predicate).toLowerCase()));
 
-      // Outgoing relationships only — incoming render backwards and confuse context
-      const outgoing = detail.triples.filter((t: any) => t.direction === "outgoing");
-      const incoming = detail.triples.filter((t: any) => t.direction === "incoming");
       for (const t of outgoing) {
-        if (parts.length >= 6) break;
+        if (parts.length >= 4) break;
+        if (isGenericEntityName(t.related_name)) continue;
         parts.push(`${t.predicate} ${t.related_name}`);
       }
-      // For incoming: flip to a readable form (e.g. "parent_of Nico Brunetti")
+
       const flipPredicate: Record<string, string> = {
         child_of: "parent_of", parent_of: "child_of",
         married_to: "married_to", same_as: "same_as",
         works_with: "works_with", collaborates_with: "collaborates_with",
+        member_of: "has_member", owns: "owned_by",
       };
       for (const t of incoming) {
-        if (parts.length >= 8) break;
+        if (parts.length >= 5) break;
+        if (isGenericEntityName(t.related_name)) continue;
         const flipped = flipPredicate[t.predicate];
         if (flipped) parts.push(`${flipped} ${t.related_name}`);
       }
 
-      // A few properties (phone, email, age, etc.)
-      for (const p of detail.properties.slice(0, 2)) {
-        parts.push(`${p.key}=${p.value}`);
+      for (const p of detail.properties) {
+        if (parts.length >= 5) break;
+        const key = String(p.key || "").trim();
+        const value = String(p.value || "").trim();
+        if (!key || !value) continue;
+        if (isSensitiveProperty(key, value)) continue;
+        parts.push(`${key}=${value}`);
       }
 
       if (parts.length > 0) {
@@ -390,31 +572,20 @@ export default function register(api: any): void {
       const prompt: string = event?.prompt;
       if (!prompt || prompt.length < 5) return undefined;
 
-      // Extract entity names from the prompt (NLP, fast)
-      const entities = extractEntities(prompt, graph);
+      // Strip inbound metadata (conversation info, sender info, untrusted context
+      // blocks, Discord/channel envelope) so entity extraction only sees the
+      // actual user message. Without this, platform names like "Discord", generic
+      // words like "config", and channel metadata trigger false entity matches.
+      const userMessage = stripPromptMetadata(prompt);
+      if (!userMessage || userMessage.length < 3) return undefined;
 
-      // Collect unique entity names sorted by confidence
-      const entityNames = entities
-        .sort((a, b) => b.confidence - a.confidence)
-        .slice(0, 8) // cap at 8 entities to keep context tight
-        .map((e) => e.name);
-
-      // FTS fallback: also search for capitalized words/phrases from the prompt
-      // This catches names like "Brandon" that NLP misses in short questions
-      const capitalizedTokens = (prompt.match(/\b[A-Z][a-z]{2,}\b/g) || [])
-        .filter((w) => !["Who", "What", "Where", "When", "How", "Why", "Is", "Are", "Can", "Did", "Does", "The", "And"].includes(w));
-      for (const token of capitalizedTokens) {
-        if (!entityNames.includes(token.toLowerCase())) {
-          entityNames.push(token.toLowerCase());
-        }
-      }
-
+      const entityNames = resolvePromptEntities(userMessage, graph);
       if (entityNames.length === 0) return undefined;
 
       const context = formatKGContext(entityNames, graph);
       if (!context) return undefined;
 
-      log("info", `kg: injecting context for ${entityNames.length} entities`);
+      log("info", `kg: injecting prompt-relevant context for ${entityNames.join(", ")}`);
       return { prependContext: context };
     } catch (err) {
       log("warn", `kg: before_prompt_build error: ${err}`);
